@@ -1,10 +1,66 @@
+#!/usr/bin/env python3
 import threading, traceback
 import os, sys, time, random, cmd, stat
 from math import *
 import shelve, sqlite3
 import re
 
-PATH = "c:/"
+PATH = ""
+_dbkey = None
+DB_PATH = None
+db_lock = None
+size = None
+db = None
+LAST_PATH = None
+DB_VERSION = 0
+
+def print_help():
+  print("\n  space_analyzer.py [scan path, default is \"c:\\\"] [--reset] [--help -h]")
+  sys.stdout.flush()
+
+def parse_args():
+  global PATH, _dbkey, DB_PATH, db_lock, size, db, LAST_PATH, DB_VERSION
+  
+  args = sys.argv[1:]
+
+  for arg in args:
+    if arg == "--help" or arg == "-h":
+      print_help()
+      sys.exit(0)
+  
+  path = ""
+  for arg in args:
+    if arg != "--reset":
+      path += " " + arg
+
+  PATH = path.strip()
+  if len(PATH) == 0:
+    PATH = "c:/"
+  PATH = PATH[0].lower() + PATH[1:]
+  PATH = os.path.normpath(os.path.abspath(PATH))
+  if not PATH.endswith(os.path.sep):
+    PATH += os.path.sep
+
+  #print("PATH", PATH)
+
+  _dbkey = PATH.replace("/", "_").replace("\\", "_").replace("-", "_").replace(" ", "_").replace(":", "_")
+
+  DB_PATH = "_" + _dbkey + "_space_analyzer.db"
+  db_lock = threading.Lock()
+  size = [0]
+  db = [0]
+
+  LAST_PATH = _dbkey + "_space_last_path.txt"
+
+  for arg in args:
+    if arg == "--reset":
+      if os.path.exists(DB_PATH):
+        print("Deleting database")
+        os.unlink(DB_PATH)
+      if os.path.exists(LAST_PATH):
+        print("Deleting state")
+        os.unlink(LAST_PATH)
+      sys.exit(0);
 
 if len(sys.argv) > 1:
   PATH = sys.argv[1].strip()
@@ -14,18 +70,8 @@ if len(sys.argv) > 1:
   if not PATH.endswith(os.path.sep):
     PATH += os.path.sep
 
+parse_args()
 print("PATH:", PATH)
-  
-DB_VERSION = 0
-
-_dbkey = PATH.replace("/", "_").replace("\\", "_").replace("-", "_").replace(" ", "_").replace(":", "_")
-
-DB_PATH = "_" + _dbkey + "_space_analyzer.db"
-db_lock = threading.Lock()
-size = [0]
-db = [0]
-
-LAST_PATH = _dbkey + "_space_last_path.txt"
 
 def safepath(path):
   #return escape(path)
