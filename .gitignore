@@ -1,0 +1,7 @@
+*.db
+*_last_path.txt
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.coverage

@@ -1,643 +1,388 @@
 #!/usr/bin/env python3
-import threading, traceback
-import os, sys, time, random, cmd, stat
-from math import *
-import shelve, sqlite3
-import re
+"""space_analyzer: scan a Windows drive for large files and folders.
 
-PATH = ""
-_dbkey = None
-DB_PATH = None
-db_lock = None
-size = None
-db = None
-LAST_PATH = None
+CLI entry point. Heavy lifting lives in `db.py`, `fs.py`, `scanner.py`,
+and `util.py`. Importing this module has no side effects -- everything
+happens inside the click commands.
+
+Output discipline (for LLM/script consumers):
+  - Data (top, query results) goes to stdout.
+  - Progress, status, and informational messages go to stderr.
+  - --json modes emit machine-parseable structures on stdout (or NDJSON
+    progress events on stderr for `scan --json`).
+"""
+import cmd
+import json
+import os
+import sys
+import threading
+import time
+
+import click
+
+from db import DBSqLite
+from fs import RealFs
+from scanner import Scanner
+from util import formatsize, parse_size, safepath
+
+
 DB_VERSION = 0
+DEFAULT_PATH = "c:/"
 
-def print_help():
-  print("\n  space_analyzer.py [scan path, default is \"c:\\\"] [--reset] [--help -h]")
-  sys.stdout.flush()
 
-def parse_args():
-  global PATH, _dbkey, DB_PATH, db_lock, size, db, LAST_PATH, DB_VERSION
-  
-  args = sys.argv[1:]
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
-  for arg in args:
-    if arg == "--help" or arg == "-h":
-      print_help()
-      sys.exit(0)
-  
-  path = ""
-  for arg in args:
-    if arg != "--reset":
-      path += " " + arg
+def db_paths_for(scan_path):
+    key = (
+        scan_path
+        .replace("/", "_")
+        .replace("\\", "_")
+        .replace("-", "_")
+        .replace(" ", "_")
+        .replace(":", "_")
+    )
+    return "_" + key + "_space_analyzer.db", key + "_space_last_path.txt"
 
-  PATH = path.strip()
-  if len(PATH) == 0:
-    PATH = "c:/"
-  PATH = PATH[0].lower() + PATH[1:]
-  PATH = os.path.normpath(os.path.abspath(PATH))
-  if not PATH.endswith(os.path.sep):
-    PATH += os.path.sep
 
-  #print("PATH", PATH)
+def _normalize_path(path):
+    path = os.path.normpath(os.path.abspath(path))
+    if not path.endswith(os.path.sep):
+        path += os.path.sep
+    return path
 
-  _dbkey = PATH.replace("/", "_").replace("\\", "_").replace("-", "_").replace(" ", "_").replace(":", "_")
 
-  DB_PATH = "_" + _dbkey + "_space_analyzer.db"
-  db_lock = threading.Lock()
-  size = [0]
-  db = [0]
+def _row_to_dict(row):
+    return {
+        "path": row.path,
+        "size": int(row.size),
+        "is_dir": bool(row.is_dir),
+        "db_version": row.db_version,
+    }
 
-  LAST_PATH = _dbkey + "_space_last_path.txt"
 
-  for arg in args:
-    if arg == "--reset":
-      if os.path.exists(DB_PATH):
-        print("Deleting database")
-        os.unlink(DB_PATH)
-      if os.path.exists(LAST_PATH):
-        print("Deleting state")
-        os.unlink(LAST_PATH)
-      sys.exit(0);
+# ---------------------------------------------------------------------------
+# REPL (interactive mode only)
+# ---------------------------------------------------------------------------
 
-if len(sys.argv) > 1:
-  PATH = sys.argv[1].strip()
-  PATH = PATH[0].lower() + PATH[1:]
-  PATH = os.path.normpath(os.path.abspath(PATH))
-  
-  if not PATH.endswith(os.path.sep):
-    PATH += os.path.sep
+class ExitSignal(RuntimeError):
+    pass
 
-parse_args()
-print("PATH:", PATH)
 
-def safepath(path):
-  #return escape(path)
-  
-  p = ''
-  for c in path:
-    n = ord(c)
-    
-    if n < 10 or n > 210:
-      c = "?"
-    
-    p += c
-  
-  return p
-  
-if os.path.exists(LAST_PATH):
-  with open(LAST_PATH, "r") as file:
-    s = file.read().strip()
-    
-    if not os.path.exists(s):
-      print("ERROR! last_path does not exist!")
-    else:
-      print("Resuming from " + safepath(s))
-      PATH = s
+class Console(cmd.Cmd):
+    intro = "Scanning"
+    prompt = "> "
+    file = None
 
-def scandir(path):
-  if 0:
-    st = os.stat(path)
-    print(st.st_file_attributes)
+    def __init__(self, scanner):
+        super().__init__()
+        self.scanner = scanner
 
-    for k in dir(stat):
-      if not k.startswith("FILE_"):
-        continue
-        
-      v = getattr(stat, k)
-      if st.st_file_attributes & v:
-        print(k)
-      
-      if st.st_mode & stat.S_IFLNK:
-        print("S_IFLNK")
-  
-  try:
-    ret = list(os.scandir(path))
-  except PermissionError:
-    sys.stderr.write("Failed to open %s\n" % path)
-    #traceback.print_last()
-    ret = []
-  
-  ret.sort(key = lambda item: item.name.lower())
-  
-  return ret 
-  
-def resumable_walk(start_path):
-  path = start_path
-  path = os.path.abspath(os.path.normpath(path))
-  
-  segments = []
-  p = path
-  lastp = 173
-  
-  while p != lastp:
-    segments.append(os.path.split(path)[1])
-    lastp = p
-    p = os.path.split(p)[0]
-    
-  path = os.path.normpath(os.path.abspath(path))
-  segments = path.split(os.path.sep)
-  stack = []
-  
-  #wind all iterators
-  path2 = ""
-  for i in range(len(segments)):
-    path2 = os.path.join(path2, segments[i])
-    
-    if not path2.endswith(os.path.sep):
-      path2 += os.path.sep
-    
-    diter = iter(scandir(path2))
-    
-    if i == 0:
-      for entry in scandir(path2):
-        print(entry.name)
-    
-    print("")
-    
-    if i < len(segments) - 1:
-      next = segments[i + 1].lower()
-      
-      while 1:
-        try:
-          entry = diter.__next__()
-        except StopIteration:
-          diter = None
-          break
-        
-        if i == 0:
-          print(entry.name)
-        
-        if entry.name.lower() == next:
-          break
-      
-    if not diter:
-      #print(stack, list(scandir(path2)))
-      print("Walk resumption error", path2)
-      #sys.exit()
-      
-      diter = iter(scandir(path2))
-    
-    stack.append([path2, diter])
-  
-  while len(stack) > 0:
-    root, diter = stack.pop()
-    
-    dirs = []
-    files = []
-    
-    entries = []
-    while 1:
-      try:
-        entry = diter.__next__()
-      except StopIteration:
-        break
-      
-      entries.append(entry)
-      
-    entries.reverse()
-    
-    for entry in entries:
-      if "Windows\\WUModels" in entry.path or \
-         "@rocket.chat" in entry.path or \
-         "rocketchat" in entry.path or \
-         "Rocket.Chat" in entry.path:
-        #windows symlink bug, not being detected by scandir
-        continue
-      
-      try:
-        entry.is_dir()
-      except PermissionError:
-        print("Cannot access", safepath(entry.path))
-        continue
-      
-      if entry.is_dir():
-        if not entry.is_symlink():
-          dirs.append(entry.name)
-          path3 = entry.path          
-          stack.append([path3, iter(scandir(path3))])
-      else:
-        files.append(entry.name)
-      
-    yield root, dirs, files
+    def do_v(self, arg):
+        "toggle verbose output"
+        self.scanner.verbose = not self.scanner.verbose
+        print("VERBOSE", self.scanner.verbose)
 
-if 0:      
-  for root, dirs, files in resumable_walk("c:/dev"):
-    print(dirs)
-    print("")
-  sys.exit(0)
+    def do_q(self, arg):
+        "exit"
+        raise ExitSignal
 
-class Global:
-  def __init__(self):
-    self.verbose = 0
+    def do_quit(self, arg):
+        "exit"
+        raise ExitSignal
 
-glob = Global()
+    def do_exit(self, arg):
+        "exit"
+        raise ExitSignal
 
-def escape(k):
-  if type(k) == str:
-    k2 = ""
-    
-    for c in k:
-      n = ord(c)
-      if c == "\"" or c == "'" or n < 14 or n > 220:
-        c = "_$_CHR_%i_" % n
-      k2 += c
-    
-    return "\"" + k2 + "\""
+    def do_s(self, arg):
+        "print current size sum"
+        print(formatsize(self.scanner.total_size()))
 
-pattern = re.compile(r"(.*)_\$_CHR_([0-9]+)(_.*)")
-def unescape(k):
-  def repl(m):
-    n = int(m.group(2))
-    
-    if n < 220:
-      n = chr(n)
-    else:
-      n =  "?"
-    
-    return m.group(1) + n + m.group(3)
-    
-  return re.sub(pattern, repl, k)
+    def do_p(self, arg):
+        "print top N entries by size: p [N]"
+        maxn = 15
+        if arg.strip():
+            try:
+                maxn = int(arg.strip().split()[0])
+            except ValueError:
+                pass
+        rows = self.scanner.get_top(maxn)
+        for f in rows:
+            print(formatsize(f.size), safepath(f.path))
+        print()
+        print("Size:", formatsize(self.scanner.total_size()))
 
-if 0:
-  k = escape("sdfsfdsf\n")  
-  print(unescape(k))
-  sys.exit()
 
-class DBFile:
-  def __init__(self, is_dir=False, path=""):
-    self.is_dir = is_dir
-    self.path = path
-    self.size = 0
-    self.key = ""
-    self.db_version = DB_VERSION
-  
-  def clone(self):
-    f = DBFile()
-    f.is_dir = self.is_dir
-    f.path = self.path
-    f.size = self.size 
-    f.key = self.key
-    f.db_version = self.db_version
-    
-    return f
-    
-class DBSqLite:
-  def __init__(self, path):
-    self.path = path
-    self.last_save = 0
-    self.cache = {}
-    self.write_cache = {}
-    
-    self.closed = False
-    
-    create = not os.path.exists(path)
-    
-    #disable thread exclusion
-    #, 5, 0, None, False
+# ---------------------------------------------------------------------------
+# scan implementations
+# ---------------------------------------------------------------------------
 
-    self.con = sqlite3.connect(path, check_same_thread=False)
-    cur = self.cur = self.con.cursor()
-    
-    if create:
-      print("Creating database table")
-      cur.execute("""CREATE TABLE files
-      (key text, is_dir bool, path text, size real, db_version real)""")
-      cur.execute("""CREATE INDEX idx_key on files (key)""")
-      cur.execute("""CREATE INDEX idx_size on files (size)""")
-      
-      self.con.commit()
-      
-  def __enter__(self):
-    return self
-  
-  def __exit__(self, a, b, c):
-    self.close()
-    
-  def flush(self):
-    for k in self.write_cache:
-      q = "SELECT * FROM files WHERE key=%s" % escape(k)
-      insert = True
-      
-      for row in self.cur.execute(q):
-        insert = False
-      
-      f = self.write_cache[k]
-      f.key = k
-        
-      if insert:
-        #print("INSERTING")
-        q = """INSERT INTO files (key,is_dir,path,size,db_version)
-                         VALUES (%s,%s,%s,%s,%s)""" % \
-          (escape(f.key), f.is_dir, escape(f.path), f.size, f.db_version)
-      else:
-        q = """UPDATE files SET is_dir=%s,path=%s,size=%s,db_version=%s WHERE key=%s""" % \
-        (f.is_dir, escape(f.path), f.size, f.db_version, escape(f.key))
-        
-        #print("UPDATING")
-        pass
-        
-      self.cur.execute(q)
-    
-    self.con.commit()
-    self.cur = self.con.cursor()    
-    self.write_cache = {}
-    
-  def _lookup(self, k):
-    q = "SELECT * FROM files WHERE key=" + escape(k)
-    for row in self.cur.execute(q):
-      f = DBFile()
-      f.key = unescape(k)
-      #print("ROW", row)
-      f.is_dir = row[1]
-      f.path = unescape(row[2])
-      f.size = row[3]
-      f.db_version = row[4]
-      
-      return f
-    return None
-  
-  def get_top(self, n=55, prefix=None):
-    self.flush()
-    
-    q = "SELECT key FROM files ORDER BY size DESC LIMIT " + str(n)
-    
-    """
-    if prefix is not None:
-      pattern = prefix.strip() + "*"
-      q = "SELECT key FROM files WHERE path LIKE %s ORDER BY size DESC LIMIT %i" % (escape(pattern), n)
-      
-      print(q)
-    #"""
-    
-    ret = []
-    keys = []
-    
-    for row in self.cur.execute(q):
-      keys.append(row[0])
-      
-    for k in keys:
-      ret.append(self[k])
-    
-    return ret
-    
-  def __getitem__(self, k):
-    if self.closed:
-      return None
-      
-    if k in self.cache:
-      return self.cache[k]
-    
-    f = self._lookup(k)
-    
-    if f is not None:
-      self.cache[k] = f
-      return f
-    return None
-    
-  def __setitem__(self, k, v):
-    self.cache[k] = self.write_cache[k] = v
-    
-    if time.time() - self.last_save > 15:
-      self.flush()
-      self.last_save = time.time()
-  
-  def __contains__(self, k):
-    if k in self.cache:
-      return True
-      
-    f = self._lookup(k)
-    if f is not None:
-      self.cache[k] = f
-      
-    return f is not None
-    
-  def close(self):
-    self.flush()
-    self.con.commit()
-    self.con.close()
-    self.closed = True
+def _make_progress_callback(json_mode):
+    """Return a callback that emits progress to stderr. Text or NDJSON."""
+    start = time.time()
 
-def test_db():
-  if 1: #with DBSqLite(DB_PATH) as db:
-    global db
-    
-    print("key" in db)
-    if "key" in db:
-      print(db["key"])
-    f = DBFile()
-    f.db_version = 2
-    f.size = 3
-    f.path = "path"
-    f.is_dir = True
-    
-    db["key"] = f
-    
-    keys = ["path2", "path3", "path4", "path5", "ath"]
-    
-    for k in keys:
-      f = f.clone()
-      f.path = k
-      f.size = int(random.random()*1000.0)
-      db[k] = f
-    
-    for f in db.get_top():
-      print(" ", f.size, f.path)
-    
-  sys.exit(0)
-
-#test_db()
-
-def formatsize(f):
-  if f > 1024*1024*1024:
-    f = "%.4fgb" % (f / 1024/1024/1024)
-  elif f > 1024*1024:
-    f = "%.2fmb" % (f / 1024/1024)
-  elif f > 1024*1024:
-    f = "%.2fkb" % (f / 1024)
-  return f
-
-do_stop = [False]
-
-def job():
-  if 1: #with DBSqLite(DB_PATH) as db:
-    global db
-    print("Staring job")
-      
-    last_print = time.time()
-    
-    ci = 0
-    last_time2 = time.time()
-    
-    for root, dirname, files in resumable_walk(PATH):
-      for f in files:        
-        #save walk resume point
-        if time.time() - last_time2 > 0.5:
-          with open(LAST_PATH, "w") as file:
-            file.write(root)
-          last_time2 = time.time()
-          
-        #give other threads cpu time
-        if ci > 655:
-          time.sleep(0.001)
-          ci = 0
+    def cb(files_scanned, bytes_scanned, current_root):
+        if json_mode:
+            evt = {
+                "event": "progress",
+                "files": int(files_scanned),
+                "bytes": int(bytes_scanned),
+                "current_path": current_root,
+                "elapsed_seconds": round(time.time() - start, 3),
+            }
+            sys.stderr.write(json.dumps(evt) + "\n")
         else:
-          ci += 1
-          
-        doprint = time.time() - last_print > 0.75
-        if doprint:
-          last_print = time.time()
-          
-        if do_stop[0]:
-          return
-                
+            sys.stderr.write(
+                "scanned %d files, %s, in %s\n"
+                % (files_scanned, formatsize(bytes_scanned),
+                   safepath(current_root))
+            )
+        sys.stderr.flush()
+
+    cb.start = start
+    return cb
+
+
+def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
+    """Run a scan. Returns exit code."""
+    scan_path = _normalize_path(scan_root)
+    db_path, last_path = db_paths_for(scan_path)
+
+    if os.path.exists(last_path):
+        with open(last_path, "r") as fh:
+            saved = fh.read().strip()
+        if os.path.exists(saved):
+            click.echo("Resuming from %s" % safepath(saved), err=True)
+            scan_path = saved
+        else:
+            click.echo("WARNING: last_path does not exist: %s" % safepath(saved),
+                       err=True)
+
+    click.echo("PATH: %s" % scan_path, err=True)
+
+    db = DBSqLite(db_path)
+    progress_cb = _make_progress_callback(json_mode) if (json_mode or verbose) else None
+    scanner = Scanner(
+        fs=RealFs(),
+        db=db,
+        root=scan_path,
+        state_path=last_path,
+        db_version=DB_VERSION,
+        verbose=verbose,
+        progress_callback=progress_cb,
+    )
+
+    if interactive:
+        thread = threading.Thread(target=scanner.run, daemon=True)
+        thread.start()
         try:
-          path = os.path.join(root, f)
-          path = os.path.normpath(os.path.abspath(path))
-        except UnicodeEncodeError:
-          #print("invalid path")
-          continue
-        
-        if glob.verbose and time.time() - last_print > 0.1:
-          print(safepath(path))
-          last_print = time.time()
-          
-        if doprint:
-          pass #print(safepath(path))
+            Console(scanner).cmdloop()
+        except (ExitSignal, KeyboardInterrupt):
+            click.echo("Exiting", err=True)
+        finally:
+            scanner.stop()
+            thread.join(timeout=5)
+            db.close()
+        return 0
 
-        with db_lock:
-          entry = db[path]
-          
-          if entry is None:
-            entry = DBFile(False, path)
-            entry.db_version = -1
-            
-          if entry.db_version == DB_VERSION:
-            size[0] += entry.size
-            continue
-          
-          try:
-            st = os.stat(path)
-            isdir = stat.S_ISDIR(st.st_mode)
-          except:
-            #print("failed to open file", safepath(path))
-            continue
-            
-          if doprint:
-            #print(st.st_size, isdir)
-            #print(formatsize(size[0]))
-            pass
-          
-          sz = st.st_size
-          size[0] += sz
-          
-          lastparent = None
-          parent = os.path.split(path)[0]
-          n = 0
-          
-          entry.size = st.st_size
-          entry.db_version = DB_VERSION
-          db[path] = entry
+    # non-interactive: run synchronously and exit
+    try:
+        scanner.run()
+    except KeyboardInterrupt:
+        click.echo("Interrupted", err=True)
+        scanner.stop()
+        db.close()
+        return 130
 
-          while parent != lastparent and len(parent) > 0:
-            n += 1
-            if n > 100:
-              print("EEK!", parent)
-              break
-            
-            if parent in db:
-              entry2 = db[parent]
-            else:
-              entry2 = DBFile(True, parent)
-            
-            entry2.size += st.st_size
-            db[parent] = entry2
-
-            lastparent = parent
-            parent = os.path.split(parent)[0]
-    
-class ExitSignal (RuntimeError):
-  pass
-  
-class Console (cmd.Cmd):
-  intro = "Scanning"
-  prompt = "> "
-  file = None
-  
-  def do_v(self, arg):
-    'verbose'
-    
-    with db_lock:
-      glob.verbose ^= True
-      print("VERBOSE", glob.verbose)
-  
-  def do_q(self, arg):
-    'exit'
-    raise ExitSignal
-    
-  def do_quit(self, arg):
-    'exit'
-    raise ExitSignal
-  
-  def do_exit(self, arg):
-    'exit'
-    raise ExitSignal
- 
-  def do_s(self, arg):
-    'print current size sum'
-    print(formatsize(size[0]))
-      
-  def do_p(self, arg):
-    'print size'
-    args = arg.split(" ")
-    arg = args[0]
-    
-    maxn = 15
-    
-    if arg:
-      try:
-        maxn = int(arg)
-      except:
-        pass
-        
-    if len(args) > 1:
-      prefix = args[1]
+    if json_mode:
+        elapsed = time.time() - progress_cb.start if progress_cb else 0
+        sys.stderr.write(json.dumps({
+            "event": "done",
+            "files": int(scanner.files_scanned),
+            "bytes": int(scanner.size),
+            "elapsed_seconds": round(elapsed, 3),
+        }) + "\n")
+        sys.stderr.flush()
     else:
-      prefix = None
-    
-    with db_lock:
-      for f in db.get_top(maxn, prefix):
-        print(formatsize(f.size), f.path)
-        
-      print("\n\n")
-      
-    print("Size:", formatsize(size[0]))
-    
-def main():
-  global db 
-  
-  db = DBSqLite(DB_PATH)
-  
-  thread = threading.Thread(target=job)
-  thread.start()
+        click.echo("Scan complete: %d files, %s"
+                   % (scanner.files_scanned, formatsize(scanner.size)), err=True)
+    db.close()
+    return 0
 
-  try:
-    Console().cmdloop()
-  except ExitSignal:
-    print("Exiting")
-    do_stop[0] = True
 
-    with db_lock:
-      db.close()      
-  except KeyboardInterrupt:
-    print("Exiting")
-    do_stop[0] = True
+def _reset_impl(scan_root):
+    scan_path = _normalize_path(scan_root)
+    db_path, last_path = db_paths_for(scan_path)
+    removed = []
+    for p in (db_path, last_path):
+        if os.path.exists(p):
+            os.unlink(p)
+            removed.append(p)
+    for p in removed:
+        click.echo("Removed %s" % p, err=True)
+    if not removed:
+        click.echo("Nothing to remove for %s" % scan_path, err=True)
+    return 0
 
-    with db_lock:
-      db.close()
-    
+
+# ---------------------------------------------------------------------------
+# click group + subcommands
+# ---------------------------------------------------------------------------
+
+class CliGroup(click.Group):
+    """Group that supports legacy bare-invocation usage:
+
+      space_analyzer.py                -> scan --interactive c:/
+      space_analyzer.py D:/foo         -> scan --interactive D:/foo
+      space_analyzer.py D:/foo --reset -> reset D:/foo
+      space_analyzer.py --reset        -> reset c:/
+      space_analyzer.py scan ...       -> normal subcommand routing
+      space_analyzer.py top ...        -> normal subcommand routing
+    """
+
+    def resolve_command(self, ctx, args):
+        if args and args[0] in self.commands:
+            return super().resolve_command(ctx, args)
+        if "--reset" in args:
+            path_args = [a for a in args if a != "--reset"]
+            return "reset", self.commands["reset"], path_args
+        return "scan", self.commands["scan"], ["--interactive"] + args
+
+
+@click.group(
+    cls=CliGroup,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    invoke_without_command=True,
+)
+@click.option("--reset", "legacy_reset", is_flag=True, hidden=True)
+@click.pass_context
+def cli(ctx, legacy_reset):
+    """Scan a drive for large files and folders.
+
+    Subcommands:
+      scan   - walk a path and persist sizes (with --interactive for a REPL)
+      top    - print the largest entries from a previous scan
+      query  - look up a single path's size
+      reset  - delete the DB for a scan root
+
+    With no subcommand, behaves like the old tool: scans interactively.
+    Quote PATH if it contains spaces.
+    """
+    if ctx.invoked_subcommand is None:
+        if legacy_reset:
+            ctx.exit(_reset_impl(DEFAULT_PATH))
+        ctx.exit(_scan_impl(DEFAULT_PATH, interactive=True))
+
+
+@cli.command()
+@click.argument("path", type=click.Path(), default=DEFAULT_PATH)
+@click.option("--interactive", is_flag=True,
+              help="Stay in the REPL after launching the scan thread.")
+@click.option("--json", "json_mode", is_flag=True,
+              help="Emit JSONL progress events on stderr; nothing on stdout.")
+@click.option("-v", "--verbose", is_flag=True,
+              help="Print human-readable progress on stderr.")
+def scan(path, interactive, json_mode, verbose):
+    """Walk PATH and persist file/dir sizes to the per-path DB.
+
+    Without --interactive, runs to completion and exits.
+    """
+    sys.exit(_scan_impl(path, interactive=interactive, json_mode=json_mode, verbose=verbose))
+
+
+@cli.command()
+@click.option("--scan-root", default=DEFAULT_PATH, show_default=True,
+              help="Which scan's DB to read from.")
+@click.option("-n", "n", type=int, default=15, show_default=True,
+              help="Number of rows to return.")
+@click.option("--json", "json_mode", is_flag=True,
+              help="Emit results as a JSON array on stdout.")
+@click.option("--min-size", default=None,
+              help="Only rows >= this size (e.g. 1gb, 500mb, 1024).")
+@click.option("--prefix", default=None,
+              help="Only rows whose path starts with this prefix.")
+@click.option("--files-only", is_flag=True, help="Exclude directories.")
+@click.option("--dirs-only", is_flag=True, help="Exclude files.")
+def top(scan_root, n, json_mode, min_size, prefix, files_only, dirs_only):
+    """Print the largest entries from a previous scan, optionally filtered."""
+    if files_only and dirs_only:
+        raise click.UsageError("--files-only and --dirs-only are mutually exclusive")
+
+    min_size_bytes = None
+    if min_size is not None:
+        try:
+            min_size_bytes = parse_size(min_size)
+        except ValueError as e:
+            raise click.UsageError(str(e))
+
+    scan_path = _normalize_path(scan_root)
+    db_path, _ = db_paths_for(scan_path)
+    if not os.path.exists(db_path):
+        click.echo("No scan DB found for %s (run `scan` first)" % scan_path, err=True)
+        sys.exit(1)
+
+    db = DBSqLite(db_path)
+    try:
+        rows = db.get_top(
+            n=n,
+            min_size=min_size_bytes,
+            prefix=prefix,
+            files_only=files_only,
+            dirs_only=dirs_only,
+        )
+    finally:
+        db.close()
+
+    if json_mode:
+        click.echo(json.dumps([_row_to_dict(r) for r in rows]))
+    else:
+        for r in rows:
+            click.echo("%s %s" % (formatsize(r.size), safepath(r.path)))
+
+
+@cli.command()
+@click.argument("path", type=click.Path())
+@click.option("--scan-root", default=DEFAULT_PATH, show_default=True,
+              help="Which scan's DB to read from.")
+@click.option("--json", "json_mode", is_flag=True,
+              help="Emit the result as a JSON object on stdout.")
+def query(path, scan_root, json_mode):
+    """Look up a single PATH's recorded size."""
+    scan_path = _normalize_path(scan_root)
+    db_path, _ = db_paths_for(scan_path)
+    if not os.path.exists(db_path):
+        click.echo("No scan DB found for %s (run `scan` first)" % scan_path, err=True)
+        sys.exit(1)
+
+    db = DBSqLite(db_path)
+    try:
+        row = db.get_by_path(path)
+    finally:
+        db.close()
+
+    if row is None:
+        if json_mode:
+            click.echo(json.dumps({"path": path, "found": False}))
+        else:
+            click.echo("not in DB: %s" % path, err=True)
+        sys.exit(1)
+
+    if json_mode:
+        d = _row_to_dict(row)
+        d["found"] = True
+        click.echo(json.dumps(d))
+    else:
+        click.echo("%s %s" % (formatsize(row.size), safepath(row.path)))
+
+
+@cli.command()
+@click.argument("path", type=click.Path(), default=DEFAULT_PATH)
+def reset(path):
+    """Delete the DB and resume-state files for a scan root."""
+    sys.exit(_reset_impl(path))
+
+
 if __name__ == "__main__":
-  main()
-
+    cli()
