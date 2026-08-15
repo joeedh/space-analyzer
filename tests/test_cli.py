@@ -1,5 +1,7 @@
+import io
 import json
 import os
+import time
 
 from click.testing import CliRunner
 
@@ -318,7 +320,6 @@ class _FakeScanner:
 
 
 def _console(stdout=None, stdin=None, state="running", rows=()):
-    import io
     c = space_analyzer.Console(_FakeScanner(rows), {"state": state, "error": None})
     c.stdout = stdout if stdout is not None else io.StringIO()
     c.stdin = stdin if stdin is not None else io.StringIO("\n")
@@ -358,38 +359,111 @@ def test_status_line_includes_total_files_and_current_path():
     assert "c:/windows/system32" in line
 
 
-def test_t_command_prints_one_snapshot_when_not_a_tty():
-    import io
+class TtyIO(io.StringIO):
+    def isatty(self):
+        return True
+
+
+def test_s_prints_one_snapshot_when_not_a_tty():
     out = io.StringIO()          # StringIO.isatty() is False
     c = _console(stdout=out)
-    c.do_t("")
+    c.do_s("")
     assert "c:/windows/system32" in out.getvalue()
-    assert "\r" not in out.getvalue()
+    assert chr(13) not in out.getvalue()
+    assert c._live is False, "no refresh thread without a terminal"
 
 
-def test_t_command_rewrites_in_place_on_a_tty():
-    import io
+def test_s_toggles_the_live_total_on_and_off(capsys):
+    c = _console(stdout=TtyIO())
+    try:
+        c.do_s("")
+        assert c._live is True
+        assert c._live_thread is not None and c._live_thread.is_alive()
+        assert "on" in capsys.readouterr().out
 
-    class TtyIO(io.StringIO):
-        def isatty(self):
-            return True
+        c.do_s("")
+        assert c._live is False
+        assert "off" in capsys.readouterr().out
+    finally:
+        c.stop_live()
 
+
+def test_live_line_redraws_the_row_above_the_cursor(monkeypatch):
+    """The refresh must step up one row and come back, never writing on the
+    prompt row -- that is what keeps typed input intact."""
+    monkeypatch.setattr(space_analyzer, "LIVE_REFRESH_SECONDS", 0.01)
     out = TtyIO()
-    c = _console(stdout=out, stdin=io.StringIO("\n"))
-    c.do_t("")
-    text = out.getvalue()
-    assert "\r" in text, "expected a carriage-return rewrite"
-    assert space_analyzer.ERASE_LINE in text
-    assert text.endswith("\n"), "must leave the cursor on a fresh line"
-
-
-def test_t_command_is_listed_in_help():
-    import io
-    out = io.StringIO()
     c = _console(stdout=out)
-    with __import__("contextlib").redirect_stdout(out):
-        c.do_help("")
-    assert "\nt " in out.getvalue() or "  t " in out.getvalue()
+    try:
+        c.do_s("")
+        c.postcmd(False, "s")          # attaches: status row, cursor below
+        deadline = time.time() + 2
+        while out.getvalue().count(space_analyzer.CURSOR_UP) < 2:
+            assert time.time() < deadline, "live line never refreshed"
+            time.sleep(0.01)
+    finally:
+        c.stop_live()
+
+    text = out.getvalue()
+    draw = text[text.index(space_analyzer.SAVE_CURSOR):]
+    assert draw.startswith(
+        space_analyzer.SAVE_CURSOR + space_analyzer.CURSOR_UP
+        + chr(13) + space_analyzer.ERASE_LINE)
+    assert space_analyzer.RESTORE_CURSOR in draw
+
+
+def test_command_output_is_not_eaten_by_the_live_line():
+    """`p` output must scroll above and the total re-appear underneath."""
+    out = TtyIO()
+    c = _console(stdout=out, rows=_report_rows())
+    try:
+        c.do_s("")
+        c.postcmd(False, "s")
+        out.truncate(0)
+        out.seek(0)
+
+        c.precmd("p")                   # cmd.Cmd flow around a command
+        out.write("REPORT ROW" + chr(10))
+        c.postcmd(False, "p")
+    finally:
+        c.stop_live()
+
+    text = out.getvalue()
+    assert "REPORT ROW" in text
+    assert text.index("REPORT ROW") < text.index("c:/windows/system32"),         "status line must be redrawn after the command output, not before"
+    assert text.endswith(chr(10)), "cursor must be left on a fresh row for the prompt"
+
+
+def test_live_line_pauses_while_a_command_runs(monkeypatch):
+    monkeypatch.setattr(space_analyzer, "LIVE_REFRESH_SECONDS", 0.01)
+    out = TtyIO()
+    c = _console(stdout=out)
+    try:
+        c.do_s("")
+        c.precmd("p")                   # detached: a command owns the screen
+        out.truncate(0)
+        out.seek(0)
+        time.sleep(0.05)
+        assert out.getvalue() == "", "refresh must not draw over command output"
+    finally:
+        c.stop_live()
+
+
+def test_stop_live_joins_the_thread():
+    c = _console(stdout=TtyIO())
+    c.do_s("")
+    thread = c._live_thread
+    c.stop_live()
+    assert not thread.is_alive()
+    assert c._live_thread is None
+
+
+def test_s_is_listed_in_help(capsys):
+    _console().do_help("")
+    out = capsys.readouterr().out
+    assert "redraws in place" in out
+    assert not hasattr(space_analyzer.Console, "do_t"), \
+        "the old `t` command was folded into `s`"
 
 
 def test_progress_callback_in_place_fits_terminal_width(monkeypatch):

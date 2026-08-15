@@ -59,6 +59,15 @@ than the terminal wraps, which leaves the cursor a row down and makes the next C
 wrong row. Anything drawn in place must be truncated first, and must be closed with a newline
 (`_end_progress_line`) before other output follows.
 
+**The live total (`s`) owns exactly one row: the one above the cursor.** `postcmd` draws it
+and leaves the cursor on the next row, where `input()` puts the prompt; `_live_loop` then
+refreshes with save-cursor → `CURSOR_UP` → rewrite → restore-cursor. It only ever moves *up*
+and back, which can never scroll the terminal, and it never writes on the prompt row — that
+is what keeps the prompt and anything half-typed at it intact. `precmd` detaches for the
+duration of a command so its output scrolls normally, and `postcmd` re-attaches below it.
+Drawing the status on the prompt row instead (the obvious implementation) erases whatever
+the user is typing every refresh.
+
 **Tests never touch the real filesystem** — they build a `MockFs` from a seed. New scanner
 tests should go through the `mock_fs` / `scanner` fixtures in `tests/conftest.py` rather
 than scanning a temp dir.

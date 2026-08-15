@@ -34,7 +34,13 @@ DEFAULT_PATH = "c:/"
 # ANSI: erase from the cursor to the end of the line. Paired with a leading
 # CR this rewrites the current line without leaving stale characters behind.
 ERASE_LINE = "\x1b[K"
+CURSOR_UP = "\x1b[A"
+SAVE_CURSOR = "\x1b7"
+RESTORE_CURSOR = "\x1b8"
 
+# How often the live total (`s`) redraws. Five times a second reads as
+# continuous without the flicker and wasted wakeups of a faster loop; much
+# slower than this and the number visibly lags the scan.
 LIVE_REFRESH_SECONDS = 0.2
 
 # How many of the largest entries a `j` report carries.
@@ -130,9 +136,7 @@ class Console(cmd.Cmd):
         ("p [N]",
          "Print the top N largest entries scanned so far (default 15)."),
         ("s",
-         "Print the running total of bytes scanned this session."),
-        ("t",
-         "Live-updating running total; press Enter to stop watching."),
+         "Toggle a live running total that redraws in place; `s` again stops it."),
         ("j [FILE]",
          "Write a JSON report of the largest entries (overwrites FILE)."),
         ("v",
@@ -147,6 +151,13 @@ class Console(cmd.Cmd):
         super().__init__()
         self.scanner = scanner
         self.status = status if status is not None else {"state": "unknown", "error": None}
+        # Live-total state. `_live_attached` is True only while the status
+        # line owns the row directly above the cursor -- see _live_loop.
+        self._live = False
+        self._live_attached = False
+        self._live_thread = None
+        self._live_stop = threading.Event()
+        self._live_lock = threading.Lock()
 
     # ---- commands -------------------------------------------------------
 
@@ -173,75 +184,103 @@ class Console(cmd.Cmd):
         print()
         print("Size:", formatsize(self.scanner.total_size()))
 
-    def do_s(self, arg):
-        """Print the running total of bytes scanned this session.
-
-        Usage: s
-
-        Also prints the scan thread's state (running / done / crashed),
-        so you can tell whether the background scan is still alive. The
-        size is the in-memory sum the scanner has accumulated since this
-        process started; it does not include sizes carried over from a
-        previous scan's DB rows.
-        """
-        print(formatsize(self.scanner.total_size()))
+    def scan_state(self):
         state = self.status.get("state", "unknown")
         err = self.status.get("error")
         if err is not None:
-            print("scan state: %s (%s: %s)" % (state, type(err).__name__, err))
-        else:
-            print("scan state:", state)
-        print("files scanned this session:", self.scanner.files_scanned)
+            return "%s (%s: %s)" % (state, type(err).__name__, err)
+        return state
 
     def status_line(self):
-        """One-line summary of the scan's progress."""
+        """One-line summary of the scan's progress.
+
+        The size is the in-memory sum the scanner has accumulated since this
+        process started; it does not include sizes carried over from a
+        previous scan's DB rows.
+        """
         total = self.scanner.total_size()
-        return "%s (%d bytes) in %d files | %s" % (
+        return "%s (%d bytes) | %d files | %s | %s" % (
             formatsize(total),
             total,
             self.scanner.files_scanned,
+            self.scan_state(),
             safepath(self.scanner.current_path),
         )
 
-    def do_t(self, arg):
-        """Watch the running total update in place.
+    def do_s(self, arg):
+        """Toggle the live running total. Run `s` again to stop it.
 
-        Usage: t
+        Usage: s
 
-        Redraws a single line -- bytes accounted for so far, files scanned,
-        and the directory currently being walked -- until you press Enter.
-        On a non-terminal stdout it prints one snapshot instead of animating.
+        Draws one line -- bytes accounted for so far, files scanned, the
+        scan thread's state, and the directory being walked -- and keeps
+        redrawing it in place about five times a second. The line always
+        sits just above the prompt: output from other commands scrolls above
+        it and it re-appears underneath, so nothing you print gets eaten.
+
+        On a non-terminal stdout there is nowhere to redraw, so this prints
+        a single snapshot instead.
         """
         if not _isatty(self.stdout):
             self.stdout.write(self.status_line() + "\n")
             self.stdout.flush()
             return
+        if self._live:
+            self.stop_live()
+            print("live total: off")
+            return
+        self._live = True
+        self._live_stop.clear()
+        self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
+        self._live_thread.start()
+        print("live total: on (run 's' again to stop)")
 
-        stop = threading.Event()
-
-        def refresh():
-            while True:
-                self.stdout.write("\r" + ERASE_LINE + _fit(self.status_line()))
-                self.stdout.flush()
-                if stop.wait(LIVE_REFRESH_SECONDS):
-                    return
-                if self.status.get("state") != "running":
-                    # final redraw, then let the watcher fall out on its own
-                    self.stdout.write("\r" + ERASE_LINE + _fit(self.status_line()))
-                    self.stdout.flush()
-                    return
-
-        thread = threading.Thread(target=refresh, daemon=True)
-        thread.start()
-        try:
-            self.stdin.readline()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            stop.set()
+    def stop_live(self):
+        """Stop the refresh thread, leaving the last line drawn on screen."""
+        self._live = False
+        self._live_stop.set()
+        thread, self._live_thread = self._live_thread, None
+        if thread is not None:
             thread.join(timeout=1)
-            self.stdout.write("\r" + ERASE_LINE + self.status_line() + "\n")
-            self.stdout.flush()
+        with self._live_lock:
+            self._live_attached = False
+
+    def _live_loop(self):
+        """Redraw the status row while it sits directly above the cursor.
+
+        `postcmd` leaves the status on its own row and the cursor on the row
+        below, where the prompt is drawn. So a refresh saves the cursor,
+        steps up exactly one row, rewrites it, and restores. Moving up and
+        back can never scroll the terminal, which is what keeps the prompt
+        and anything typed at it untouched -- we never write on that row.
+        """
+        while not self._live_stop.wait(LIVE_REFRESH_SECONDS):
+            with self._live_lock:
+                if not self._live_attached:
+                    # A command is running; its output owns the screen.
+                    continue
+                self.stdout.write(
+                    SAVE_CURSOR + CURSOR_UP + "\r" + ERASE_LINE
+                    + _fit(self.status_line()) + RESTORE_CURSOR
+                )
+                self.stdout.flush()
+
+    def precmd(self, line):
+        # Detach for the duration of the command so its output scrolls
+        # normally instead of being fought over by the refresh thread.
+        with self._live_lock:
+            self._live_attached = False
+        return line
+
+    def postcmd(self, stop, line):
+        # Re-draw the status below whatever the command printed, then leave
+        # the cursor on the next row for the prompt.
+        with self._live_lock:
+            if self._live and not stop:
+                self.stdout.write("\r" + ERASE_LINE + _fit(self.status_line()) + "\n")
+                self.stdout.flush()
+                self._live_attached = True
+        return stop
 
     def report(self):
         """Build the JSON-serializable report for the scan's current state."""
@@ -437,7 +476,7 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
         # Always attach the callback and gate it on `scanner.verbose`, so the
         # REPL's `v` command can turn per-directory logging on and off while
         # the scan thread is already running. Scroll rather than rewrite in
-        # place: `t` owns the in-place line, and this shares the terminal
+        # place: `s` owns the in-place line, and this shares the terminal
         # with the prompt.
         scanner.progress_callback = _make_progress_callback(
             json_mode, gate=lambda: scanner.verbose, in_place=False)
@@ -469,11 +508,13 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
 
         thread = threading.Thread(target=run_scan, daemon=True)
         thread.start()
+        console = Console(scanner, status)
         try:
-            Console(scanner, status).cmdloop()
+            console.cmdloop()
         except (ExitSignal, KeyboardInterrupt):
             click.echo("Exiting", err=True)
         finally:
+            console.stop_live()
             scanner.stop()
             thread.join(timeout=5)
             db.close()

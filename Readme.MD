@@ -62,12 +62,33 @@ while you query it from a prompt.
 | Command | Description |
 | --- | --- |
 | `p [N]` | Print the top N largest entries found so far (default 15) |
-| `s` | Print bytes scanned this session and the scan thread's state |
-| `t` | Watch the running total update in place; press Enter to stop |
+| `s` | Toggle a live running total that redraws in place; `s` again stops it |
 | `j [FILE]` | Write a JSON report of the largest entries so far |
 | `v` | Toggle verbose logging of the directory being walked |
 | `help [CMD]`, `h`, `?` | Show commands, or detailed help for one |
 | `q`, `quit`, `exit` | Stop the scan, flush the database, and exit |
+
+`s` starts a running total that rewrites its own line about five times a
+second and sits just above the prompt:
+
+```
+14.65kb (15000 bytes) | 30 files | running | c:/windows/system32
+>
+```
+
+Other commands print above it and it re-appears underneath, so nothing you
+print gets eaten:
+
+```
+> p
+  1.94gb c:/users/joeed/appdata
+  1.21gb c:/windows/winsxs
+14.65kb (15000 bytes) | 30 files | running | c:/windows/system32
+>
+```
+
+Run `s` again to stop it, leaving the last line on screen. Piped to a file
+there is nowhere to redraw, so `s` prints a single snapshot instead.
 
 `j` writes a snapshot without leaving the REPL — the scan's totals plus the 500
 largest entries recorded so far:
