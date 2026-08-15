@@ -61,12 +61,20 @@ class RealFs(FsProvider):
                 )
             except OSError:
                 stat_like = StatLike(0, 0, 0)
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+            except OSError:
+                is_dir = False
+            try:
+                is_symlink = e.is_symlink()
+            except OSError:
+                is_symlink = True  # err on the side of skipping
             entries.append(
                 Entry(
                     name=e.name,
                     path=e.path,
-                    is_dir=e.is_dir(follow_symlinks=False),
-                    is_symlink=e.is_symlink(),
+                    is_dir=is_dir,
+                    is_symlink=is_symlink,
                     stat_=stat_like,
                 )
             )

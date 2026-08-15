@@ -62,6 +62,17 @@ def test_paths_with_special_chars_roundtrip(tmp_db_path):
     db.close()
 
 
+def test_lone_surrogate_path_does_not_crash(tmp_db_path):
+    """Windows NTFS filenames may contain unpaired UTF-16 surrogates."""
+    db = DBSqLite(tmp_db_path)
+    bad = "/a/lone\udc80surrogate"
+    db[bad] = DBFile(False, bad, 42, bad, 0)
+    db.flush()
+    rows = db.get_top(10)
+    assert any(r.size == 42 for r in rows)
+    db.close()
+
+
 def test_reinsert_does_not_duplicate(tmp_db_path):
     db = DBSqLite(tmp_db_path)
     db["k"] = DBFile(False, "p", 10, "k", 0)

@@ -81,7 +81,7 @@ class DBSqLite:
         rows = []
         for k, f in self.write_cache.items():
             f.key = k
-            rows.append((f.key, 1 if f.is_dir else 0, f.path, f.size, f.db_version))
+            rows.append((_sqlite_safe(f.key), 1 if f.is_dir else 0, _sqlite_safe(f.path), f.size, f.db_version))
         self.cur.executemany(
             """
             INSERT INTO files (key, is_dir, path, size, db_version)
@@ -213,7 +213,17 @@ class DBSqLite:
         self.closed = True
 
 
+def _sqlite_safe(s):
+    """Strip lone surrogates so the string round-trips through SQLite's UTF-8.
+
+    Windows filenames can contain unpaired UTF-16 surrogates that Python keeps
+    as lone surrogate codepoints; these are not valid UTF-8 and crash sqlite3
+    on insert. Replace them with U+FFFD so the row can still be stored.
+    """
+    return s.encode("utf-8", "replace").decode("utf-8")
+
+
 def key_for_path(path):
     """Stable key for a path. Lowercased on Windows so case-insensitive
     paths don't produce duplicate rows."""
-    return path.replace("\\", "/").lower()
+    return _sqlite_safe(path.replace("\\", "/").lower())

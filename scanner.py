@@ -72,14 +72,14 @@ class Scanner:
 
             dirs, files = [], []
             for e in entries:
-                if e.is_symlink() or _looks_like_reparse_point(e):
-                    continue
                 try:
+                    if e.is_symlink() or _looks_like_reparse_point(e):
+                        continue
                     if e.is_dir():
                         dirs.append(e)
                     else:
                         files.append(e)
-                except PermissionError:
+                except OSError:
                     continue
             yield cur, dirs, files
             # push in reverse so traversal order matches sorted order

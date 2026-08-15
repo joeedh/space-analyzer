@@ -52,6 +52,23 @@ def test_bare_invocation_with_explicit_path(monkeypatch):
     assert captured["interactive"] is True
 
 
+def test_bare_invocation_interactive_flag_at_group_level(monkeypatch):
+    """`space_analyzer.py --interactive [PATH]` should route to scan-interactive,
+    not fail with `No such option '--interactive'`."""
+    captured = _patch_scan(monkeypatch)
+    result = CliRunner().invoke(space_analyzer.cli, ["--interactive", "D:/foo"])
+    assert result.exit_code == 0, result.output
+    assert captured["path"] == "D:/foo"
+    assert captured["interactive"] is True
+
+
+def test_bare_invocation_interactive_flag_no_path(monkeypatch):
+    captured = _patch_scan(monkeypatch)
+    result = CliRunner().invoke(space_analyzer.cli, ["--interactive"])
+    assert result.exit_code == 0, result.output
+    assert captured["interactive"] is True
+
+
 def test_bare_invocation_with_quoted_path(monkeypatch):
     captured = _patch_scan(monkeypatch)
     result = CliRunner().invoke(space_analyzer.cli, ["C:/Program Files"])

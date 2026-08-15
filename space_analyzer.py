@@ -17,6 +17,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 
 import click
 
@@ -71,48 +72,140 @@ class ExitSignal(RuntimeError):
 
 
 class Console(cmd.Cmd):
-    intro = "Scanning"
+    intro = (
+        "Scanning in the background. Type 'help' (or '?') for commands, "
+        "'q' to exit."
+    )
     prompt = "> "
     file = None
 
-    def __init__(self, scanner):
+    # Ordered list of (usage, one-line description) for the `help` table.
+    # Detailed help for any single command comes from its docstring.
+    _COMMAND_HELP = [
+        ("p [N]",
+         "Print the top N largest entries scanned so far (default 15)."),
+        ("s",
+         "Print the running total of bytes scanned this session."),
+        ("v",
+         "Toggle verbose mode -- log per-directory progress to stderr."),
+        ("h, help [CMD], ?",
+         "Show this help, or detailed help for CMD."),
+        ("q, quit, exit",
+         "Stop the scan, flush the DB, and exit."),
+    ]
+
+    def __init__(self, scanner, status=None):
         super().__init__()
         self.scanner = scanner
+        self.status = status if status is not None else {"state": "unknown", "error": None}
 
-    def do_v(self, arg):
-        "toggle verbose output"
-        self.scanner.verbose = not self.scanner.verbose
-        print("VERBOSE", self.scanner.verbose)
-
-    def do_q(self, arg):
-        "exit"
-        raise ExitSignal
-
-    def do_quit(self, arg):
-        "exit"
-        raise ExitSignal
-
-    def do_exit(self, arg):
-        "exit"
-        raise ExitSignal
-
-    def do_s(self, arg):
-        "print current size sum"
-        print(formatsize(self.scanner.total_size()))
+    # ---- commands -------------------------------------------------------
 
     def do_p(self, arg):
-        "print top N entries by size: p [N]"
+        """Print the top N largest entries currently in the DB.
+
+        Usage: p [N]
+          N   number of rows to print (default 15)
+
+        Queries the DB while the scan is still running, so the list grows
+        and shifts between calls. After the rows, prints the running total
+        of bytes scanned this session.
+        """
         maxn = 15
         if arg.strip():
             try:
                 maxn = int(arg.strip().split()[0])
             except ValueError:
-                pass
+                print("p: expected an integer, got %r" % arg.strip())
+                return
         rows = self.scanner.get_top(maxn)
         for f in rows:
             print(formatsize(f.size), safepath(f.path))
         print()
         print("Size:", formatsize(self.scanner.total_size()))
+
+    def do_s(self, arg):
+        """Print the running total of bytes scanned this session.
+
+        Usage: s
+
+        Also prints the scan thread's state (running / done / crashed),
+        so you can tell whether the background scan is still alive. The
+        size is the in-memory sum the scanner has accumulated since this
+        process started; it does not include sizes carried over from a
+        previous scan's DB rows.
+        """
+        print(formatsize(self.scanner.total_size()))
+        state = self.status.get("state", "unknown")
+        err = self.status.get("error")
+        if err is not None:
+            print("scan state: %s (%s: %s)" % (state, type(err).__name__, err))
+        else:
+            print("scan state:", state)
+        print("files scanned this session:", self.scanner.files_scanned)
+
+    def do_v(self, arg):
+        """Toggle verbose mode.
+
+        Usage: v
+
+        When verbose is on, the scanner logs each permission error and
+        scandir failure to stderr instead of silently skipping it.
+        """
+        self.scanner.verbose = not self.scanner.verbose
+        print("verbose:", "on" if self.scanner.verbose else "off")
+
+    def do_q(self, arg):
+        """Stop the scan, flush the DB, and exit."""
+        raise ExitSignal
+
+    def do_quit(self, arg):
+        """Stop the scan, flush the DB, and exit."""
+        raise ExitSignal
+
+    def do_exit(self, arg):
+        """Stop the scan, flush the DB, and exit."""
+        raise ExitSignal
+
+    def do_h(self, arg):
+        """Alias for `help`."""
+        return self.do_help(arg)
+
+    # ---- help -----------------------------------------------------------
+
+    def do_help(self, arg):
+        """Show available commands, or detailed help for a single command.
+
+        Usage: help [CMD]
+        """
+        arg = arg.strip()
+        if arg:
+            # Delegate to cmd.Cmd's default, which prints the do_<cmd> docstring.
+            return super().do_help(arg)
+        usage_w = max(len(u) for u, _ in self._COMMAND_HELP)
+        print()
+        print("Commands:")
+        for usage, desc in self._COMMAND_HELP:
+            print("  %-*s   %s" % (usage_w, usage, desc))
+        print()
+        print("Type 'help <command>' for detailed help on a command,")
+        print("e.g. 'help p'.")
+        print()
+
+    # Hide aliases from cmd.Cmd's auto-listing so `help` (when not overridden)
+    # would not duplicate them. Our override doesn't use this, but `?` still
+    # falls through to cmd.Cmd internals which inspects do_* attribute names.
+    def get_names(self):
+        return [n for n in super().get_names()
+                if n not in ("do_quit", "do_exit", "do_h")]
+
+    def emptyline(self):
+        # Default cmd.Cmd behavior is to repeat the last command on empty
+        # input, which is surprising here. Do nothing instead.
+        pass
+
+    def default(self, line):
+        print("Unknown command: %r. Type 'help' for the command list." % line)
 
 
 # ---------------------------------------------------------------------------
@@ -175,10 +268,31 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
     )
 
     if interactive:
-        thread = threading.Thread(target=scanner.run, daemon=True)
+        status = {"state": "running", "error": None}
+
+        def run_scan():
+            try:
+                scanner.run()
+            except BaseException as exc:
+                status["state"] = "crashed"
+                status["error"] = exc
+                sys.stderr.write(
+                    "\n[scan thread crashed: %s: %s]\n%s"
+                    % (type(exc).__name__, exc, traceback.format_exc())
+                )
+                sys.stderr.flush()
+            else:
+                status["state"] = "done"
+                sys.stderr.write(
+                    "\n[scan complete: %d files, %s]\n"
+                    % (scanner.files_scanned, formatsize(scanner.size))
+                )
+                sys.stderr.flush()
+
+        thread = threading.Thread(target=run_scan, daemon=True)
         thread.start()
         try:
-            Console(scanner).cmdloop()
+            Console(scanner, status).cmdloop()
         except (ExitSignal, KeyboardInterrupt):
             click.echo("Exiting", err=True)
         finally:
@@ -253,7 +367,13 @@ class CliGroup(click.Group):
 
 @click.group(
     cls=CliGroup,
-    context_settings={"help_option_names": ["-h", "--help"]},
+    context_settings={
+        "help_option_names": ["-h", "--help"],
+        # Let unknown options (e.g. `--interactive`, `-v`) flow through to
+        # CliGroup.resolve_command so legacy invocations like
+        # `space_analyzer.py --interactive D:/foo` still route to `scan`.
+        "ignore_unknown_options": True,
+    },
     invoke_without_command=True,
 )
 @click.option("--reset", "legacy_reset", is_flag=True, hidden=True)
