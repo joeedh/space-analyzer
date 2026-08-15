@@ -116,6 +116,9 @@ class Scanner:
 
     def run(self):
         """Single-shot scan. Safe to call again on the same DB to resume."""
+        # Clear a stop left over from a previous run so the same Scanner can
+        # be restarted; callers must join the old run's thread first.
+        self._stop = False
         self.size = 0
         self.files_scanned = 0
         now = time.time()

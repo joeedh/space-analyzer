@@ -139,6 +139,8 @@ class Console(cmd.Cmd):
          "Toggle a live running total that redraws in place; `s` again stops it."),
         ("j [FILE]",
          "Write a JSON report of the largest entries (overwrites FILE)."),
+        ("r [-y]",
+         "Reset: discard the scan DB and start the scan over from the root."),
         ("v",
          "Toggle verbose mode -- log the current directory to stderr."),
         ("h, help [CMD], ?",
@@ -147,10 +149,13 @@ class Console(cmd.Cmd):
          "Stop the scan, flush the DB, and exit."),
     ]
 
-    def __init__(self, scanner, status=None):
+    def __init__(self, scanner, status=None, restart=None):
         super().__init__()
         self.scanner = scanner
         self.status = status if status is not None else {"state": "unknown", "error": None}
+        # Callable that wipes the DB and relaunches the scan thread; supplied
+        # by _scan_impl, which owns the thread. None disables `r`.
+        self.restart = restart
         # Live-total state. `_live_attached` is True only while the status
         # line owns the row directly above the cursor -- see _live_loop.
         self._live = False
@@ -326,6 +331,55 @@ class Console(cmd.Cmd):
         print("wrote %s (%d entries, %s)"
               % (path, data["entry_count"], formatsize(data["bytes_scanned"])))
 
+    def do_r(self, arg):
+        """Throw away the scan DB and start the scan over from the root.
+
+        Usage: r [-y]
+          -y   skip the confirmation prompt
+
+        Equivalent to `space_analyzer.py reset` followed by a fresh scan,
+        except the DB file is emptied in place rather than deleted -- SQLite
+        still has it open. The resume marker is removed too, so the new scan
+        starts at the scan root rather than wherever the last one left off.
+
+        This discards every row recorded so far, including rows carried over
+        from earlier runs, so it asks first unless given -y.
+        """
+        if self.restart is None:
+            print("reset is not available here (no scan thread to restart)")
+            return
+
+        assume_yes = arg.strip().lower() in ("-y", "y", "yes")
+        if not assume_yes and not self._confirm_reset():
+            print("reset cancelled")
+            return
+
+        print("resetting...")
+        try:
+            dropped = self.restart()
+        except Exception as exc:
+            print("reset failed: %s: %s" % (type(exc).__name__, exc))
+            return
+        print("dropped %d rows; rescanning %s"
+              % (dropped, safepath(self.scanner.root)))
+
+    def _confirm_reset(self):
+        # The scan thread is still writing through the same sqlite cursor, so
+        # take the scanner's lock the way get_top() does before counting.
+        try:
+            with self.scanner.lock:
+                rows = self.scanner.db.count()
+        except Exception:
+            rows = -1
+        what = "the scan DB" if rows < 0 else "%d rows" % rows
+        try:
+            answer = input("discard %s and rescan %s? [y/N] "
+                           % (what, safepath(self.scanner.root)))
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        return answer.strip().lower() in ("y", "yes")
+
     def do_v(self, arg):
         """Toggle verbose mode.
 
@@ -449,6 +503,9 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
     """Run a scan. Returns exit code."""
     scan_path = _normalize_path(scan_root)
     db_path, last_path = db_paths_for(scan_path)
+    # Kept separate from scan_path, which the resume logic below may move to
+    # a subdirectory: a reset has to go back to the real root.
+    root_path = scan_path
 
     if os.path.exists(last_path):
         with open(last_path, "r") as fh:
@@ -506,17 +563,49 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
                 )
                 sys.stderr.flush()
 
-        thread = threading.Thread(target=run_scan, daemon=True)
-        thread.start()
-        console = Console(scanner, status)
+        threads = {"scan": None}
+
+        def start_scan():
+            status["state"] = "running"
+            status["error"] = None
+            threads["scan"] = threading.Thread(target=run_scan, daemon=True)
+            threads["scan"].start()
+
+        def stop_scan():
+            scanner.stop()
+            thread = threads["scan"]
+            if thread is not None:
+                thread.join(timeout=10)
+            threads["scan"] = None
+
+        def restart_scan():
+            """Empty the DB and rescan from the root. Returns rows dropped."""
+            stop_scan()
+            dropped = db.count()
+            db.clear()
+            # Drop the resume marker too, or the next start would jump back
+            # to where the discarded scan left off.
+            if os.path.exists(last_path):
+                try:
+                    os.unlink(last_path)
+                except OSError:
+                    pass
+            scanner.root = root_path
+            scanner.current_path = root_path
+            scanner.size = 0
+            scanner.files_scanned = 0
+            start_scan()
+            return dropped
+
+        start_scan()
+        console = Console(scanner, status, restart=restart_scan)
         try:
             console.cmdloop()
         except (ExitSignal, KeyboardInterrupt):
             click.echo("Exiting", err=True)
         finally:
             console.stop_live()
-            scanner.stop()
-            thread.join(timeout=5)
+            stop_scan()
             db.close()
         return 0
 

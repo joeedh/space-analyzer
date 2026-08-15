@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from db import DBFile, DBSqLite, key_for_path
@@ -168,4 +170,36 @@ def test_get_by_path_found(tmp_db_path):
 def test_get_by_path_missing(tmp_db_path):
     db = _seed_filter_db(tmp_db_path)
     assert db.get_by_path("c:/does/not/exist") is None
+    db.close()
+
+
+def test_count_and_clear(tmp_path):
+    db = DBSqLite(str(tmp_path / "t.db"))
+    assert db.count() == 0
+    for i in range(5):
+        k = key_for_path("c:/f%d" % i)
+        db[k] = DBFile(is_dir=False, path="c:/f%d" % i, size=i, key=k, db_version=0)
+    assert db.count() == 5
+
+    db.clear()
+    assert db.count() == 0
+    # the caches must not keep serving rows that no longer exist
+    assert db[key_for_path("c:/f0")] is None
+    assert db.get_top(10) == []
+
+    # and the DB is still usable afterwards
+    k = key_for_path("c:/after")
+    db[k] = DBFile(is_dir=False, path="c:/after", size=9, key=k, db_version=0)
+    assert db.count() == 1
+    db.close()
+
+
+def test_clear_drops_unflushed_writes(tmp_path):
+    db = DBSqLite(str(tmp_path / "t.db"))
+    db.last_save = time.time()   # keep the write cache from auto-flushing
+    k = key_for_path("c:/pending")
+    db[k] = DBFile(is_dir=False, path="c:/pending", size=1, key=k, db_version=0)
+    assert db.write_cache, "row should still be pending"
+    db.clear()
+    assert db.count() == 0
     db.close()

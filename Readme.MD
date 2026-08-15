@@ -64,6 +64,7 @@ while you query it from a prompt.
 | `p [N]` | Print the top N largest entries found so far (default 15) |
 | `s` | Toggle a live running total that redraws in place; `s` again stops it |
 | `j [FILE]` | Write a JSON report of the largest entries so far |
+| `r [-y]` | Reset: discard the scan database and start over from the root |
 | `v` | Toggle verbose logging of the directory being walked |
 | `help [CMD]`, `h`, `?` | Show commands, or detailed help for one |
 | `q`, `quit`, `exit` | Stop the scan, flush the database, and exit |
@@ -100,6 +101,21 @@ largest entries recorded so far:
 
 The report's `scan_state` field says whether the scan was still running when it
 was taken, so a partial report is recognizable as one.
+
+`r` throws the scan away and starts it again from the root — useful when the
+disk has changed enough that resuming would report stale sizes. It stops the
+running scan, empties the database, drops the resume marker, and restarts, so
+it asks first:
+
+```
+> r
+discard 41823 rows and rescan c:/? [y/N] y
+resetting...
+dropped 41823 rows; rescanning c:/
+```
+
+Use `r -y` to skip the prompt. Unlike the `reset` subcommand this keeps the
+database *file* — it just empties it — so the REPL can keep using it.
 
 ### Query a finished scan
 

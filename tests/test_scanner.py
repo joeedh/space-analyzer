@@ -232,3 +232,18 @@ def test_current_path_tracks_the_walk(tmp_db_path, mock_fs):
     assert seen
     assert all(p.startswith(mock_fs.root_path) for p in seen)
     db.close()
+
+
+def test_scanner_can_be_rerun_after_stop(mock_fs, tmp_path):
+    """`stop()` must not poison the Scanner -- reset restarts the same one."""
+    db = DBSqLite(str(tmp_path / "t.db"))
+    sc = Scanner(mock_fs, db, "/mock")
+    sc.run()
+    first = sc.files_scanned
+    assert first > 0
+
+    sc.stop()          # what the reset command does before restarting
+    sc.run()           # run() clears the stop flag itself
+    assert sc.files_scanned == first
+    assert sc.size == mock_fs.total_size_under(mock_fs.root_path)
+    db.close()

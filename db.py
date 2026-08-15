@@ -159,6 +159,22 @@ class DBSqLite:
     def get_by_path(self, path):
         return self._lookup(key_for_path(path))
 
+    def count(self):
+        self.flush()
+        self.cur.execute("SELECT COUNT(*) FROM files")
+        return self.cur.fetchone()[0]
+
+    def clear(self):
+        """Drop every row, plus the read/write caches that mirror them.
+
+        Deliberately no VACUUM: on a drive-sized DB it can take minutes and
+        block, and the freed pages get reused by the next scan anyway.
+        """
+        self.write_cache = {}
+        self.cache = {}
+        self.cur.execute("DELETE FROM files")
+        self.con.commit()
+
     def iter_files(self, only_files=False):
         """Stream every row. Used by Scanner for the directory aggregation pass."""
         self.flush()

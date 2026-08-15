@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import threading
 import time
 
 from click.testing import CliRunner
@@ -311,6 +312,7 @@ class _FakeScanner:
         self.root = "c:/"
         self.db_version = 0
         self.rows = list(rows)
+        self.lock = threading.Lock()
 
     def total_size(self):
         return self.size
@@ -556,3 +558,93 @@ def test_report_path_for_matches_db_naming():
     db_path, _last = space_analyzer.db_paths_for("c:/")
     report = space_analyzer.report_path_for("c:/")
     assert report.startswith(db_path.lstrip("_").replace("_space_analyzer.db", ""))
+
+
+# ---------------------------------------------------------------------------
+# `r` -- reset
+# ---------------------------------------------------------------------------
+
+class _FakeDB:
+    def __init__(self, rows=7):
+        self.rows = rows
+
+    def count(self):
+        return self.rows
+
+
+def _reset_console(restart=None, stdout=None, rows=7):
+    c = _console(stdout=stdout)
+    c.scanner.db = _FakeDB(rows)
+    c.restart = restart
+    return c
+
+
+def test_r_without_a_restart_hook_says_so(capsys):
+    c = _reset_console(restart=None)
+    c.do_r("-y")
+    assert "not available" in capsys.readouterr().out
+
+
+def test_r_with_dash_y_skips_confirmation(capsys, monkeypatch):
+    def boom(prompt=""):
+        raise AssertionError("-y must not prompt")
+
+    monkeypatch.setattr("builtins.input", boom)
+    calls = []
+    c = _reset_console(restart=lambda: (calls.append(1), 12)[1])
+    c.do_r("-y")
+    assert calls == [1]
+    out = capsys.readouterr().out
+    assert "dropped 12 rows" in out
+
+
+def test_r_asks_before_discarding(capsys, monkeypatch):
+    asked = {}
+
+    def fake_input(prompt=""):
+        asked["prompt"] = prompt
+        return "n"
+
+    monkeypatch.setattr("builtins.input", fake_input)
+    calls = []
+    c = _reset_console(restart=lambda: calls.append(1), rows=42)
+    c.do_r("")
+
+    assert calls == [], "declining must not restart the scan"
+    assert "42 rows" in asked["prompt"]
+    assert "cancelled" in capsys.readouterr().out
+
+
+def test_r_proceeds_when_confirmed(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda prompt="": "y")
+    calls = []
+    c = _reset_console(restart=lambda: (calls.append(1), 3)[1])
+    c.do_r("")
+    assert calls == [1]
+
+
+def test_r_treats_eof_as_no(monkeypatch, capsys):
+    def eof(prompt=""):
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", eof)
+    calls = []
+    c = _reset_console(restart=lambda: calls.append(1))
+    c.do_r("")
+    assert calls == []
+    assert "cancelled" in capsys.readouterr().out
+
+
+def test_r_reports_a_failing_restart(capsys):
+    def boom():
+        raise OSError("db is locked")
+
+    c = _reset_console(restart=boom)
+    c.do_r("-y")
+    out = capsys.readouterr().out
+    assert "reset failed" in out and "db is locked" in out
+
+
+def test_r_is_listed_in_help(capsys):
+    _console().do_help("")
+    assert "r [-y]" in capsys.readouterr().out

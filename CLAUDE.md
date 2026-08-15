@@ -6,7 +6,7 @@ and reports the largest entries. Python 3, `click` for the CLI, `pytest` for tes
 ## Commands
 
 ```
-python -m pytest -q                  # full suite (79 tests, <1s, no real FS access)
+python -m pytest -q                  # full suite (115 tests, <2s, no real FS access)
 python space_analyzer.py             # legacy bare form -> interactive scan of c:/
 python space_analyzer.py scan D:/foo # non-interactive scan
 python space_analyzer.py top -n 20 --min-size 1gb --dirs-only --scan-root c:/
@@ -67,6 +67,15 @@ is what keeps the prompt and anything half-typed at it intact. `precmd` detaches
 duration of a command so its output scrolls normally, and `postcmd` re-attaches below it.
 Drawing the status on the prompt row instead (the obvious implementation) erases whatever
 the user is typing every refresh.
+
+**The REPL's `r` (reset) empties the DB in place; it does not delete the file.** SQLite holds
+the file open and Windows won't let us unlink it out from under the connection, so
+`restart_scan()` stops the scan thread, calls `db.clear()` (`DELETE FROM files`, no VACUUM —
+minutes of blocking on a drive-sized DB for pages the next scan reuses anyway), removes the
+resume marker, resets the scanner's counters and root back to the *pre-resume* root, and
+starts a fresh thread. `Scanner.run()` therefore clears `self._stop` on entry, so the same
+Scanner instance survives a `stop()`/`run()` cycle. The `reset` *subcommand* is different: it
+deletes the files outright, which is fine because nothing has them open.
 
 **Tests never touch the real filesystem** — they build a `MockFs` from a seed. New scanner
 tests should go through the `mock_fs` / `scanner` fixtures in `tests/conftest.py` rather
