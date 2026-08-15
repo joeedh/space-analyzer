@@ -112,3 +112,123 @@ def test_scan_handles_special_char_filenames(tmp_db_path, mock_fs):
     assert row.path == weird
     assert row.size == 12345
     db.close()
+
+
+def _tree_with_target():
+    """Small explicit tree: /mock/target holds two files worth 3000 bytes."""
+    fs = MockFs(seed=1337, max_depth=0)
+    fs.add_dir("/mock/target")
+    fs.add_file("/mock/target/a.bin", size=1000)
+    fs.add_file("/mock/target/b.bin", size=2000)
+    fs.add_file("/mock/loose.bin", size=7)
+    return fs
+
+
+def test_junctions_are_not_descended_into(tmp_db_path):
+    mock_fs = _tree_with_target()
+    """An NTFS junction reports is_dir()=True and is_symlink()=False, so only
+    the reparse attribute distinguishes it. Descending would double-count."""
+    target = mock_fs._nodes["/mock/target"]
+    expected = mock_fs.total_size_under(mock_fs.root_path)
+    mock_fs.add_junction(mock_fs.root_path + "/__junction", target=target.path)
+
+    db = DBSqLite(tmp_db_path)
+    s = Scanner(fs=mock_fs, db=db, root=mock_fs.root_path, db_version=0)
+    s.run()
+
+    assert s.size == expected, "junction target counted twice"
+    assert db[key_for_path(mock_fs.root_path + "/__junction")] is None
+    db.close()
+
+
+def test_junction_children_are_not_recorded_under_the_junction(tmp_db_path):
+    mock_fs = _tree_with_target()
+    target = mock_fs._nodes["/mock/target"]
+    junction = mock_fs.root_path + "/__junction"
+    mock_fs.add_junction(junction, target=target.path)
+
+    db = DBSqLite(tmp_db_path)
+    s = Scanner(fs=mock_fs, db=db, root=mock_fs.root_path, db_version=0)
+    s.run()
+
+    for row in db.iter_files():
+        assert not row.path.startswith(junction + "/"), row.path
+    db.close()
+
+
+def test_symlinked_directories_are_not_descended_into(tmp_db_path):
+    from fs import IO_REPARSE_TAG_SYMLINK
+
+    mock_fs = _tree_with_target()
+    target = mock_fs._nodes["/mock/target"]
+    expected = mock_fs.total_size_under(mock_fs.root_path)
+    mock_fs.add_junction(mock_fs.root_path + "/__dirlink", target=target.path,
+                         reparse_tag=IO_REPARSE_TAG_SYMLINK)
+
+    db = DBSqLite(tmp_db_path)
+    s = Scanner(fs=mock_fs, db=db, root=mock_fs.root_path, db_version=0)
+    s.run()
+
+    assert s.size == expected
+    db.close()
+
+
+def test_reparse_point_files_are_still_counted(tmp_db_path, mock_fs):
+    """OneDrive placeholders and dedup-backed files carry a reparse point but
+    are real files occupying real bytes -- they must not be skipped."""
+    from fs import IO_REPARSE_TAG_CLOUD
+
+    baseline = mock_fs.total_size_under(mock_fs.root_path)
+    cloud = mock_fs.root_path + "/__cloud.bin"
+    mock_fs.add_file(cloud, size=4242, reparse_tag=IO_REPARSE_TAG_CLOUD)
+
+    db = DBSqLite(tmp_db_path)
+    s = Scanner(fs=mock_fs, db=db, root=mock_fs.root_path, db_version=0)
+    s.run()
+
+    assert s.size == baseline + 4242
+    row = db[key_for_path(cloud)]
+    assert row is not None and row.size == 4242
+    db.close()
+
+
+def test_unstattable_directory_is_not_descended_into(tmp_db_path):
+    """Without attributes we cannot tell a junction from a plain directory,
+    so the walker must refuse to follow it."""
+    from fs import Entry, StatLike
+
+    mock_fs = _tree_with_target()
+    target = mock_fs._nodes["/mock/target"]
+    blocked = mock_fs.total_size_under(target.path)
+    real_scandir = mock_fs.scandir
+
+    def scandir(path):
+        out = []
+        for e in real_scandir(path):
+            if e.path == target.path:
+                e = Entry(e.name, e.path, is_dir=True, is_symlink=False,
+                          stat_=StatLike(0, 0, 0, 0), stat_ok=False)
+            out.append(e)
+        return out
+
+    mock_fs.scandir = scandir
+
+    db = DBSqLite(tmp_db_path)
+    s = Scanner(fs=mock_fs, db=db, root=mock_fs.root_path, db_version=0)
+    s.run()
+
+    assert s.size == mock_fs.total_size_under(mock_fs.root_path) - blocked
+    db.close()
+
+
+def test_current_path_tracks_the_walk(tmp_db_path, mock_fs):
+    db = DBSqLite(tmp_db_path)
+    s = Scanner(fs=mock_fs, db=db, root=mock_fs.root_path, db_version=0)
+    assert s.current_path == mock_fs.root_path
+    seen = []
+    s.progress_callback = lambda f, b, root: seen.append(s.current_path)
+    s.progress_interval = 0
+    s.run()
+    assert seen
+    assert all(p.startswith(mock_fs.root_path) for p in seen)
+    db.close()

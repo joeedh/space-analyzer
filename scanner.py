@@ -13,7 +13,7 @@ import threading
 import time
 
 from db import DBFile, key_for_path
-from fs import FsProvider
+from fs import FILE_ATTRIBUTE_REPARSE_POINT, FsProvider
 from util import safepath
 
 
@@ -23,8 +23,30 @@ def _looks_like_reparse_point(entry):
     except OSError:
         return False
     attrs = getattr(st, "st_file_attributes", 0)
-    REPARSE = 0x400  # stat.FILE_ATTRIBUTE_REPARSE_POINT
-    return bool(attrs & REPARSE)
+    return bool(attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def should_skip(entry):
+    """True if the walker must not follow/count `entry`.
+
+    Directories: skipped if they are a symlink or any kind of reparse point.
+    On Windows an NTFS junction reports is_dir() True and is_symlink() False,
+    so the reparse attribute is the only reliable signal -- and if we could
+    not stat the entry at all we skip it too, since a junction and a plain
+    directory are indistinguishable without attributes. Following a junction
+    would double-count its target and can loop forever on a cycle.
+
+    Files: skipped only if they are symlinks. A file may legitimately carry a
+    reparse point (OneDrive placeholders, dedup-backed files) and still
+    occupies its reported size, so those are counted.
+    """
+    if entry.is_symlink():
+        return True
+    if not entry.is_dir():
+        return False
+    if not getattr(entry, "stat_ok", True):
+        return True
+    return _looks_like_reparse_point(entry)
 
 
 class Scanner:
@@ -41,6 +63,7 @@ class Scanner:
 
         self.size = 0
         self.files_scanned = 0
+        self.current_path = root
         self.lock = threading.Lock()
         self._stop = False
 
@@ -73,7 +96,10 @@ class Scanner:
             dirs, files = [], []
             for e in entries:
                 try:
-                    if e.is_symlink() or _looks_like_reparse_point(e):
+                    if should_skip(e):
+                        if self.verbose and e.is_dir():
+                            sys.stderr.write(
+                                "skipping reparse point: %s\n" % safepath(e.path))
                         continue
                     if e.is_dir():
                         dirs.append(e)
@@ -98,6 +124,7 @@ class Scanner:
         for root, _dirs, files in self.walk():
             if self._stop:
                 return
+            self.current_path = root
             if self.state_path and time.time() - last_state_save > 0.5:
                 try:
                     with open(self.state_path, "w") as f:

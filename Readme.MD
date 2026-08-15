@@ -40,8 +40,15 @@ Useful flags:
 - `--json` — emit newline-delimited JSON progress events on stderr
 - `--interactive` — scan in a background thread and drop into a REPL
 
+With `-v` on a terminal, progress is drawn on a single self-updating line;
+piped to a file it scrolls one line per update instead.
+
 Scanning a whole drive takes a while. If you interrupt it (Ctrl-C), just run the
 same command again — it resumes from the last directory it recorded.
+
+Symlinks and NTFS junctions are never followed, so a junction's target is
+counted once, where it actually lives. Files backed by a reparse point
+(OneDrive placeholders, deduplicated files) are still counted normally.
 
 ### Interactive mode
 
@@ -56,9 +63,22 @@ while you query it from a prompt.
 | --- | --- |
 | `p [N]` | Print the top N largest entries found so far (default 15) |
 | `s` | Print bytes scanned this session and the scan thread's state |
-| `v` | Toggle verbose logging |
+| `t` | Watch the running total update in place; press Enter to stop |
+| `j [FILE]` | Write a JSON report of the largest entries so far |
+| `v` | Toggle verbose logging of the directory being walked |
 | `help [CMD]`, `h`, `?` | Show commands, or detailed help for one |
 | `q`, `quit`, `exit` | Stop the scan, flush the database, and exit |
+
+`j` writes a snapshot without leaving the REPL — the scan's totals plus the 500
+largest entries recorded so far:
+
+```
+> j                     # -> c__space_report.json (derived from the scan root)
+> j biggest.json        # -> biggest.json, overwriting it if it exists
+```
+
+The report's `scan_state` field says whether the scan was still running when it
+was taken, so a partial report is recognizable as one.
 
 ### Query a finished scan
 

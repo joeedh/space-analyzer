@@ -10,25 +10,33 @@ import stat
 
 
 class StatLike:
-    __slots__ = ("st_size", "st_mode", "st_file_attributes")
+    __slots__ = ("st_size", "st_mode", "st_file_attributes", "st_reparse_tag")
 
-    def __init__(self, st_size, st_mode, st_file_attributes=0):
+    def __init__(self, st_size, st_mode, st_file_attributes=0, st_reparse_tag=0):
         self.st_size = st_size
         self.st_mode = st_mode
         self.st_file_attributes = st_file_attributes
+        self.st_reparse_tag = st_reparse_tag
 
 
 class Entry:
-    """Subset of os.DirEntry the scanner needs."""
+    """Subset of os.DirEntry the scanner needs.
 
-    __slots__ = ("name", "path", "_is_dir", "_is_symlink", "_stat")
+    `stat_ok` is False when the stat call failed and `_stat` is a zeroed
+    placeholder. The scanner treats an unstattable directory as unsafe to
+    descend into, since a junction is indistinguishable from a plain
+    directory without its attributes.
+    """
 
-    def __init__(self, name, path, is_dir, is_symlink, stat_):
+    __slots__ = ("name", "path", "_is_dir", "_is_symlink", "_stat", "stat_ok")
+
+    def __init__(self, name, path, is_dir, is_symlink, stat_, stat_ok=True):
         self.name = name
         self.path = path
         self._is_dir = is_dir
         self._is_symlink = is_symlink
         self._stat = stat_
+        self.stat_ok = stat_ok
 
     def is_dir(self):
         return self._is_dir
@@ -48,19 +56,31 @@ class FsProvider:
         raise NotImplementedError
 
 
+def _to_stat_like(st):
+    return StatLike(
+        st.st_size,
+        st.st_mode,
+        getattr(st, "st_file_attributes", 0),
+        getattr(st, "st_reparse_tag", 0),
+    )
+
+
 class RealFs(FsProvider):
     def scandir(self, path):
         entries = []
         for e in os.scandir(path):
+            stat_ok = True
             try:
-                st = e.stat(follow_symlinks=False)
-                stat_like = StatLike(
-                    st.st_size,
-                    st.st_mode,
-                    getattr(st, "st_file_attributes", 0),
-                )
+                stat_like = _to_stat_like(e.stat(follow_symlinks=False))
             except OSError:
-                stat_like = StatLike(0, 0, 0)
+                # The cached DirEntry stat can fail where an explicit lstat
+                # still succeeds; retry before giving up, because losing the
+                # attributes means losing our only junction signal.
+                try:
+                    stat_like = _to_stat_like(os.lstat(e.path))
+                except OSError:
+                    stat_like = StatLike(0, 0, 0, 0)
+                    stat_ok = False
             try:
                 is_dir = e.is_dir(follow_symlinks=False)
             except OSError:
@@ -76,18 +96,23 @@ class RealFs(FsProvider):
                     is_dir=is_dir,
                     is_symlink=is_symlink,
                     stat_=stat_like,
+                    stat_ok=stat_ok,
                 )
             )
         entries.sort(key=lambda x: x.name.lower())
         return entries
 
     def stat(self, path):
-        st = os.stat(path)
-        return StatLike(
-            st.st_size,
-            st.st_mode,
-            getattr(st, "st_file_attributes", 0),
-        )
+        return _to_stat_like(os.stat(path))
+
+
+# NTFS reparse tags we care about. Values match stat.IO_REPARSE_TAG_*, which
+# only exist on Windows, so they are spelled out for cross-platform tests.
+IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003   # directory junction
+IO_REPARSE_TAG_SYMLINK = 0xA000000C
+IO_REPARSE_TAG_CLOUD = 0x9000001A         # OneDrive-style placeholder file
+
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 class _Node:
@@ -99,9 +124,10 @@ class _Node:
         "size",
         "children",
         "raises_permission_error",
+        "reparse_tag",
     )
 
-    def __init__(self, name, path, is_dir, is_symlink=False, size=0):
+    def __init__(self, name, path, is_dir, is_symlink=False, size=0, reparse_tag=0):
         self.name = name
         self.path = path
         self.is_dir = is_dir
@@ -109,6 +135,7 @@ class _Node:
         self.size = size
         self.children = []
         self.raises_permission_error = False
+        self.reparse_tag = reparse_tag
 
 
 class MockFs(FsProvider):
@@ -176,11 +203,38 @@ class MockFs(FsProvider):
 
     # ---- injection helpers used by tests --------------------------------
 
-    def add_file(self, path, size=0, is_symlink=False):
+    def add_file(self, path, size=0, is_symlink=False, reparse_tag=0):
         parent_path = path.rsplit(self.SEP, 1)[0]
         name = path.rsplit(self.SEP, 1)[1]
         parent = self._nodes[parent_path]
-        node = _Node(name=name, path=path, is_dir=False, is_symlink=is_symlink, size=size)
+        node = _Node(name=name, path=path, is_dir=False, is_symlink=is_symlink,
+                     size=size, reparse_tag=reparse_tag)
+        parent.children.append(node)
+        self._nodes[path] = node
+        return node
+
+    def add_dir(self, path):
+        parent_path, name = path.rsplit(self.SEP, 1)
+        parent = self._nodes[parent_path]
+        node = _Node(name=name, path=path, is_dir=True)
+        parent.children.append(node)
+        self._nodes[path] = node
+        return node
+
+    def add_junction(self, path, target=None, reparse_tag=IO_REPARSE_TAG_MOUNT_POINT):
+        """Add a directory junction whose contents mirror `target`.
+
+        The node reports itself as a directory (not a symlink -- that is
+        exactly how Windows presents a junction) but carries a reparse tag.
+        Its children are shared with the target so a walker that wrongly
+        descends will double-count the target's bytes and the test will
+        notice.
+        """
+        parent_path, name = path.rsplit(self.SEP, 1)
+        parent = self._nodes[parent_path]
+        node = _Node(name=name, path=path, is_dir=True, reparse_tag=reparse_tag)
+        if target is not None:
+            node.children = list(self._nodes[target].children)
         parent.children.append(node)
         self._nodes[path] = node
         return node
@@ -198,7 +252,7 @@ class MockFs(FsProvider):
             raise PermissionError(path)
         entries = []
         for child in node.children:
-            st = StatLike(child.size, self._mode_for(child))
+            st = self._stat_for(child)
             entries.append(
                 Entry(
                     name=child.name,
@@ -215,7 +269,11 @@ class MockFs(FsProvider):
         node = self._nodes.get(path)
         if node is None:
             raise FileNotFoundError(path)
-        return StatLike(node.size, self._mode_for(node))
+        return self._stat_for(node)
+
+    def _stat_for(self, node):
+        attrs = FILE_ATTRIBUTE_REPARSE_POINT if node.reparse_tag else 0
+        return StatLike(node.size, self._mode_for(node), attrs, node.reparse_tag)
 
     @staticmethod
     def _mode_for(node):
@@ -255,5 +313,7 @@ class MockFs(FsProvider):
         while stack:
             cur = stack.pop()
             yield cur
-            if cur.is_dir and not cur.raises_permission_error:
+            # Mirrors what a correct walker does: don't descend into
+            # unreadable dirs or reparse points (junctions).
+            if cur.is_dir and not cur.raises_permission_error and not cur.reparse_tag:
                 stack.extend(cur.children)

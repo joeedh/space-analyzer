@@ -294,3 +294,191 @@ def test_reset_subcommand(monkeypatch):
     result = CliRunner().invoke(space_analyzer.cli, ["reset", "D:/foo"])
     assert result.exit_code == 0
     assert captured["path"] == "D:/foo"
+
+
+# ---------------------------------------------------------------------------
+# REPL commands + progress rendering
+# ---------------------------------------------------------------------------
+
+class _FakeScanner:
+    def __init__(self, rows=()):
+        self.verbose = False
+        self.files_scanned = 3
+        self.current_path = "c:/windows/system32"
+        self.size = 1234
+        self.root = "c:/"
+        self.db_version = 0
+        self.rows = list(rows)
+
+    def total_size(self):
+        return self.size
+
+    def get_top(self, n=15):
+        return self.rows[:n]
+
+
+def _console(stdout=None, stdin=None, state="running", rows=()):
+    import io
+    c = space_analyzer.Console(_FakeScanner(rows), {"state": state, "error": None})
+    c.stdout = stdout if stdout is not None else io.StringIO()
+    c.stdin = stdin if stdin is not None else io.StringIO("\n")
+    return c
+
+
+def test_verbose_gate_toggles_progress_output():
+    """The `v` toggle must affect a callback that is already installed on a
+    running scan -- that is the whole point of gating it."""
+    scanner = _FakeScanner()
+    cb = space_analyzer._make_progress_callback(
+        False, gate=lambda: scanner.verbose, in_place=False)
+
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        cb(1, 100, "c:/a")
+        assert buf.getvalue() == ""
+        scanner.verbose = True
+        cb(2, 200, "c:/b")
+    assert "c:/b" in buf.getvalue()
+
+
+def test_v_command_toggles_scanner_verbose():
+    c = _console()
+    c.do_v("")
+    assert c.scanner.verbose is True
+    c.do_v("")
+    assert c.scanner.verbose is False
+
+
+def test_status_line_includes_total_files_and_current_path():
+    line = _console().status_line()
+    assert "(1234 bytes)" in line
+    assert "3 files" in line
+    assert "c:/windows/system32" in line
+
+
+def test_t_command_prints_one_snapshot_when_not_a_tty():
+    import io
+    out = io.StringIO()          # StringIO.isatty() is False
+    c = _console(stdout=out)
+    c.do_t("")
+    assert "c:/windows/system32" in out.getvalue()
+    assert "\r" not in out.getvalue()
+
+
+def test_t_command_rewrites_in_place_on_a_tty():
+    import io
+
+    class TtyIO(io.StringIO):
+        def isatty(self):
+            return True
+
+    out = TtyIO()
+    c = _console(stdout=out, stdin=io.StringIO("\n"))
+    c.do_t("")
+    text = out.getvalue()
+    assert "\r" in text, "expected a carriage-return rewrite"
+    assert space_analyzer.ERASE_LINE in text
+    assert text.endswith("\n"), "must leave the cursor on a fresh line"
+
+
+def test_t_command_is_listed_in_help():
+    import io
+    out = io.StringIO()
+    c = _console(stdout=out)
+    with __import__("contextlib").redirect_stdout(out):
+        c.do_help("")
+    assert "\nt " in out.getvalue() or "  t " in out.getvalue()
+
+
+def test_progress_callback_in_place_fits_terminal_width(monkeypatch):
+    monkeypatch.setattr(space_analyzer, "_term_width", lambda default=100: 40)
+    line = space_analyzer._fit("x" * 200)
+    assert len(line) <= 39
+
+
+def test_progress_callback_json_mode_is_never_in_place():
+    cb = space_analyzer._make_progress_callback(True)
+    assert cb.in_place is False
+
+
+# ---------------------------------------------------------------------------
+# `j` -- JSON report
+# ---------------------------------------------------------------------------
+
+def _report_rows():
+    return [
+        DBFile(is_dir=True, path="c:/foo", size=7_000_100,
+               key=key_for_path("c:/foo"), db_version=0),
+        DBFile(is_dir=False, path="c:/foo/big_file.bin", size=5_000_000,
+               key=key_for_path("c:/foo/big_file.bin"), db_version=0),
+    ]
+
+
+def test_j_writes_report_to_named_file(tmp_path, capsys):
+    dest = tmp_path / "report.json"
+    c = _console(rows=_report_rows())
+    c.do_j(str(dest))
+
+    data = json.loads(dest.read_text(encoding="utf-8"))
+    assert data["scan_root"] == "c:/"
+    assert data["scan_state"] == "running"
+    assert data["files_scanned"] == 3
+    assert data["bytes_scanned"] == 1234
+    assert data["entry_count"] == 2
+    assert [e["path"] for e in data["entries"]] == ["c:/foo", "c:/foo/big_file.bin"]
+    assert data["entries"][0]["is_dir"] is True
+    assert "wrote" in capsys.readouterr().out
+
+
+def test_j_defaults_to_a_name_derived_from_the_scan_root(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    c = _console(rows=_report_rows())
+    c.do_j("")
+
+    expected = space_analyzer.report_path_for("c:/")
+    assert (tmp_path / expected).exists()
+    assert expected.endswith("_space_report.json")
+
+
+def test_j_overwrites_an_existing_file(tmp_path):
+    dest = tmp_path / "report.json"
+    dest.write_text("stale contents that are not valid json" * 100, encoding="utf-8")
+    c = _console(rows=_report_rows())
+    c.do_j(str(dest))
+
+    data = json.loads(dest.read_text(encoding="utf-8"))
+    assert data["entry_count"] == 2
+    assert "stale" not in dest.read_text(encoding="utf-8")
+
+
+def test_j_strips_quotes_from_the_filename(tmp_path):
+    dest = tmp_path / "quoted report.json"
+    c = _console(rows=_report_rows())
+    c.do_j('"%s"' % dest)
+    assert dest.exists()
+
+
+def test_j_reports_scan_state_done(tmp_path):
+    dest = tmp_path / "report.json"
+    c = _console(rows=_report_rows(), state="done")
+    c.do_j(str(dest))
+    assert json.loads(dest.read_text(encoding="utf-8"))["scan_state"] == "done"
+
+
+def test_j_handles_unwritable_destination(tmp_path, capsys):
+    c = _console(rows=_report_rows())
+    c.do_j(str(tmp_path))  # a directory -- open() must fail
+    assert "could not write" in capsys.readouterr().out
+
+
+def test_j_is_listed_in_help(capsys):
+    _console().do_help("")
+    assert "j [FILE]" in capsys.readouterr().out
+
+
+def test_report_path_for_matches_db_naming():
+    db_path, _last = space_analyzer.db_paths_for("c:/")
+    report = space_analyzer.report_path_for("c:/")
+    assert report.startswith(db_path.lstrip("_").replace("_space_analyzer.db", ""))

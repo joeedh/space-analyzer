@@ -14,6 +14,7 @@ Output discipline (for LLM/script consumers):
 import cmd
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -30,13 +31,48 @@ from util import formatsize, parse_size, safepath
 DB_VERSION = 0
 DEFAULT_PATH = "c:/"
 
+# ANSI: erase from the cursor to the end of the line. Paired with a leading
+# CR this rewrites the current line without leaving stale characters behind.
+ERASE_LINE = "\x1b[K"
+
+LIVE_REFRESH_SECONDS = 0.2
+
+# How many of the largest entries a `j` report carries.
+REPORT_TOP_N = 500
+
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
-def db_paths_for(scan_path):
-    key = (
+def _isatty(stream):
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _term_width(default=100):
+    try:
+        return shutil.get_terminal_size((default, 24)).columns
+    except OSError:
+        return default
+
+
+def _fit(line):
+    """Truncate to one terminal line so the CR rewrite never wraps.
+
+    A wrapped line leaves the cursor on the next row, and the following CR
+    would then rewrite the wrong row -- the classic smeared-progress bug.
+    """
+    width = _term_width() - 1
+    if width > 0 and len(line) > width:
+        return line[:width - 1] + ">"
+    return line
+
+
+def _scan_key(scan_path):
+    return (
         scan_path
         .replace("/", "_")
         .replace("\\", "_")
@@ -44,7 +80,16 @@ def db_paths_for(scan_path):
         .replace(" ", "_")
         .replace(":", "_")
     )
+
+
+def db_paths_for(scan_path):
+    key = _scan_key(scan_path)
     return "_" + key + "_space_analyzer.db", key + "_space_last_path.txt"
+
+
+def report_path_for(scan_path):
+    """Default filename for a JSON report, named like the DB for the same root."""
+    return _scan_key(scan_path) + "_space_report.json"
 
 
 def _normalize_path(path):
@@ -86,8 +131,12 @@ class Console(cmd.Cmd):
          "Print the top N largest entries scanned so far (default 15)."),
         ("s",
          "Print the running total of bytes scanned this session."),
+        ("t",
+         "Live-updating running total; press Enter to stop watching."),
+        ("j [FILE]",
+         "Write a JSON report of the largest entries (overwrites FILE)."),
         ("v",
-         "Toggle verbose mode -- log per-directory progress to stderr."),
+         "Toggle verbose mode -- log the current directory to stderr."),
         ("h, help [CMD], ?",
          "Show this help, or detailed help for CMD."),
         ("q, quit, exit",
@@ -144,13 +193,109 @@ class Console(cmd.Cmd):
             print("scan state:", state)
         print("files scanned this session:", self.scanner.files_scanned)
 
+    def status_line(self):
+        """One-line summary of the scan's progress."""
+        total = self.scanner.total_size()
+        return "%s (%d bytes) in %d files | %s" % (
+            formatsize(total),
+            total,
+            self.scanner.files_scanned,
+            safepath(self.scanner.current_path),
+        )
+
+    def do_t(self, arg):
+        """Watch the running total update in place.
+
+        Usage: t
+
+        Redraws a single line -- bytes accounted for so far, files scanned,
+        and the directory currently being walked -- until you press Enter.
+        On a non-terminal stdout it prints one snapshot instead of animating.
+        """
+        if not _isatty(self.stdout):
+            self.stdout.write(self.status_line() + "\n")
+            self.stdout.flush()
+            return
+
+        stop = threading.Event()
+
+        def refresh():
+            while True:
+                self.stdout.write("\r" + ERASE_LINE + _fit(self.status_line()))
+                self.stdout.flush()
+                if stop.wait(LIVE_REFRESH_SECONDS):
+                    return
+                if self.status.get("state") != "running":
+                    # final redraw, then let the watcher fall out on its own
+                    self.stdout.write("\r" + ERASE_LINE + _fit(self.status_line()))
+                    self.stdout.flush()
+                    return
+
+        thread = threading.Thread(target=refresh, daemon=True)
+        thread.start()
+        try:
+            self.stdin.readline()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            stop.set()
+            thread.join(timeout=1)
+            self.stdout.write("\r" + ERASE_LINE + self.status_line() + "\n")
+            self.stdout.flush()
+
+    def report(self):
+        """Build the JSON-serializable report for the scan's current state."""
+        rows = self.scanner.get_top(REPORT_TOP_N)
+        return {
+            "scan_root": self.scanner.root,
+            "db_version": self.scanner.db_version,
+            "scan_state": self.status.get("state", "unknown"),
+            "generated_at": time.time(),
+            "files_scanned": int(self.scanner.files_scanned),
+            "bytes_scanned": int(self.scanner.total_size()),
+            "current_path": self.scanner.current_path,
+            "entry_count": len(rows),
+            "entries": [_row_to_dict(r) for r in rows],
+        }
+
+    def do_j(self, arg):
+        """Write a JSON report of the largest entries found so far.
+
+        Usage: j [FILE]
+          FILE   where to write (default: a name derived from the scan root,
+                 e.g. c__space_report.json). An existing file is overwritten.
+
+        The report holds the scan's totals plus the largest entries currently
+        in the DB (REPORT_TOP_N of them). `scan_state` says whether the scan
+        was still running when the report was taken, so a partial report is
+        recognizable as one.
+        """
+        path = arg.strip().strip('"').strip("'")
+        if not path:
+            path = report_path_for(self.scanner.root)
+
+        data = self.report()
+        try:
+            # Plain "w" truncates, so an existing report is replaced outright.
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2)
+                fh.write("\n")
+        except OSError as exc:
+            print("could not write %s: %s" % (path, exc))
+            return
+
+        print("wrote %s (%d entries, %s)"
+              % (path, data["entry_count"], formatsize(data["bytes_scanned"])))
+
     def do_v(self, arg):
         """Toggle verbose mode.
 
         Usage: v
 
-        When verbose is on, the scanner logs each permission error and
-        scandir failure to stderr instead of silently skipping it.
+        When verbose is on, the scanner logs the directory it is currently
+        walking to stderr (about once a second), along with permission
+        errors, scandir failures, and skipped reparse points. When off, all
+        of that is silently skipped.
         """
         self.scanner.verbose = not self.scanner.verbose
         print("verbose:", "on" if self.scanner.verbose else "off")
@@ -212,11 +357,24 @@ class Console(cmd.Cmd):
 # scan implementations
 # ---------------------------------------------------------------------------
 
-def _make_progress_callback(json_mode):
-    """Return a callback that emits progress to stderr. Text or NDJSON."""
+def _make_progress_callback(json_mode, gate=None, in_place=None):
+    """Return a callback that emits progress to stderr. Text or NDJSON.
+
+    `gate` is an optional predicate consulted on every call; when it returns
+    False the event is dropped. That is how the REPL's `v` toggle can turn
+    logging on and off while the scan thread is already running.
+
+    `in_place` rewrites a single line via CR + "erase to end of line" instead
+    of scrolling. Defaults to on when stderr is a terminal and we are not in
+    JSON mode.
+    """
     start = time.time()
+    if in_place is None:
+        in_place = (not json_mode) and _isatty(sys.stderr)
 
     def cb(files_scanned, bytes_scanned, current_root):
+        if gate is not None and not gate():
+            return
         if json_mode:
             evt = {
                 "event": "progress",
@@ -227,15 +385,25 @@ def _make_progress_callback(json_mode):
             }
             sys.stderr.write(json.dumps(evt) + "\n")
         else:
-            sys.stderr.write(
-                "scanned %d files, %s, in %s\n"
-                % (files_scanned, formatsize(bytes_scanned),
-                   safepath(current_root))
-            )
+            line = ("scanned %d files, %s, in %s"
+                    % (files_scanned, formatsize(bytes_scanned),
+                       safepath(current_root)))
+            if in_place:
+                sys.stderr.write("\r" + ERASE_LINE + _fit(line))
+            else:
+                sys.stderr.write(line + "\n")
         sys.stderr.flush()
 
     cb.start = start
+    cb.in_place = in_place
     return cb
+
+
+def _end_progress_line(progress_cb):
+    """Close off an in-place progress line so later output starts fresh."""
+    if progress_cb is not None and getattr(progress_cb, "in_place", False):
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
 
 def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
@@ -256,7 +424,6 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
     click.echo("PATH: %s" % scan_path, err=True)
 
     db = DBSqLite(db_path)
-    progress_cb = _make_progress_callback(json_mode) if (json_mode or verbose) else None
     scanner = Scanner(
         fs=RealFs(),
         db=db,
@@ -264,8 +431,19 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
         state_path=last_path,
         db_version=DB_VERSION,
         verbose=verbose,
-        progress_callback=progress_cb,
     )
+
+    if interactive:
+        # Always attach the callback and gate it on `scanner.verbose`, so the
+        # REPL's `v` command can turn per-directory logging on and off while
+        # the scan thread is already running. Scroll rather than rewrite in
+        # place: `t` owns the in-place line, and this shares the terminal
+        # with the prompt.
+        scanner.progress_callback = _make_progress_callback(
+            json_mode, gate=lambda: scanner.verbose, in_place=False)
+    elif json_mode or verbose:
+        scanner.progress_callback = _make_progress_callback(json_mode)
+    progress_cb = scanner.progress_callback
 
     if interactive:
         status = {"state": "running", "error": None}
@@ -305,11 +483,13 @@ def _scan_impl(scan_root, interactive=False, json_mode=False, verbose=False):
     try:
         scanner.run()
     except KeyboardInterrupt:
+        _end_progress_line(progress_cb)
         click.echo("Interrupted", err=True)
         scanner.stop()
         db.close()
         return 130
 
+    _end_progress_line(progress_cb)
     if json_mode:
         elapsed = time.time() - progress_cb.start if progress_cb else 0
         sys.stderr.write(json.dumps({

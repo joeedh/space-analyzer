@@ -43,7 +43,21 @@ case-insensitivity doesn't create duplicate rows. All SQL is parameterized; keys
 pass through `_sqlite_safe` to strip lone UTF-16 surrogates that Windows filenames can carry
 and that crash `sqlite3` on insert.
 
-**Symlinks and reparse points are skipped**, never followed (`_looks_like_reparse_point`).
+**The walker never descends into a junction** (`scanner.should_skip`). On Windows an NTFS
+junction reports `is_dir()` True and `is_symlink()` False, so the `FILE_ATTRIBUTE_REPARSE_POINT`
+bit is the only reliable signal — and a directory we could not stat at all (`entry.stat_ok`
+False) is skipped too, since it's indistinguishable from a junction. Files carrying a reparse
+point (OneDrive placeholders, dedup-backed files) *are* counted: they occupy real bytes.
+
+**Interactive progress logging is gated, not conditionally installed.** The scan thread always
+gets a progress callback whose `gate` reads `scanner.verbose`, so the REPL's `v` command can
+toggle logging on a scan that's already running. Installing the callback only when
+`verbose` was true at startup is what made `v` a no-op.
+
+**In-place output uses CR + `ERASE_LINE` and runs every line through `_fit`.** A line wider
+than the terminal wraps, which leaves the cursor a row down and makes the next CR rewrite the
+wrong row. Anything drawn in place must be truncated first, and must be closed with a newline
+(`_end_progress_line`) before other output follows.
 
 **Tests never touch the real filesystem** — they build a `MockFs` from a seed. New scanner
 tests should go through the `mock_fs` / `scanner` fixtures in `tests/conftest.py` rather
@@ -51,7 +65,8 @@ than scanning a temp dir.
 
 ## Gotchas
 
-- The DB and resume-state files are named from the scan root (`db_paths_for`) and written
+- The DB, resume-state, and default JSON-report filenames all derive from the scan root via
+  `_scan_key` (`db_paths_for`, `report_path_for`) and are written
   to the **current working directory**, not next to the scan root. Real scans produce
   multi-GB `.db` files in the repo root; they're gitignored.
 - `Scanner.total_size()` is the in-memory sum for *this session* only — a resumed scan's
